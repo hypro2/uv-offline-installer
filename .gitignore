@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Downloaded reference files (fetched on demand)
+scripts/uv-installer-original.ps1
+
+# Download & package cache
+cache/
+
+# Temp build folders
+temp_pkg_build/
+temp_wheels/
+
+# Test artifacts
+test_output*/
+test_payload*/
+test_target_install/
+
+# OS
+Thumbs.db
+.DS_Store
