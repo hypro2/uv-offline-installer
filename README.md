@@ -1,11 +1,11 @@
-# uvtool — 폐쇄망 Python + uv 설치 툴킷
+# uv-offline-installer — 폐쇄망 Python + uv 설치 툴킷
 
 > 인터넷이 차단된 환경(망분리, 폐쇄망, 에어갭)에서  
 > **uv + Python + pip 패키지**를 단 한 번의 클릭으로 설치할 수 있는 GUI 툴킷입니다.
 
 ---
 
-## 왜 uvtool인가?
+## 왜 uv-offline-installer인가?
 
 폐쇄망 PC에 Python 환경을 구축하려면 보통 이런 고통이 따릅니다.
 
@@ -14,7 +14,7 @@
 - Python 설치 경로, PATH, 환경변수를 수동으로 설정
 - 버전이 바뀔 때마다 처음부터 반복
 
-uvtool은 이 과정을 **Builder → ZIP → Installer** 3단계로 완전 자동화합니다.
+uv-offline-installer은 이 과정을 **Builder → ZIP → Installer** 3단계로 완전 자동화합니다.
 
 ---
 
