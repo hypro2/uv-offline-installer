@@ -7,7 +7,7 @@ echo Compiling GUI scripts to standalone Windows programs...
 echo.
 
 echo [1/2] Compiling installer_gui.py (Installer)...
-uv run --with pyinstaller pyinstaller --clean specs/installer_gui.spec
+uv run --with pyinstaller --with customtkinter pyinstaller --clean specs/installer_gui.spec
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to compile installer_gui.py
     pause
@@ -17,7 +17,7 @@ echo Success.
 echo.
 
 echo [2/2] Compiling builder_gui.py (Builder with embedded Installer)...
-uv run --with pyinstaller pyinstaller --clean specs/builder_gui.spec
+uv run --with pyinstaller --with customtkinter pyinstaller --clean specs/builder_gui.spec
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to compile builder_gui.py
     pause

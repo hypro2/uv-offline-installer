@@ -1,14 +1,17 @@
-import os
-import sys
-import shutil
-import subprocess
-import zipfile
-import traceback
-import json
-import hashlib
 import datetime
-import urllib.request
+import hashlib
+import json
+import os
+import re
+import shutil
 import ssl
+import subprocess
+import sys
+import traceback
+import urllib.request
+import zipfile
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 from .utils import download_file
 
 # Mapping of major.minor to latest CPython patch version for python-build-standalone tag 20260610
@@ -22,9 +25,94 @@ PYTHON_VERSION_MAP = {
 
 PBP_TAG = "20260610"
 
-def get_platform_info(target_os, target_arch):
+def detect_project_settings(project_path: str) -> Dict[str, Any]:
     """
-    Returns platform information including triples and pip platforms.
+    지정된 프로젝트 경로(project_path)의 설정을 분석합니다.
+    1. 최우선 순위로 `.python-version` 파일을 확인하여 Python 버전을 추출합니다.
+    2. `.python-version`이 없을 경우 `pyproject.toml` 파일의 `requires-python` 속성을 해석합니다.
+    3. `uv.lock` 파일 존재 여부를 확인하여 의존성 동기화 필요 여부를 감지합니다.
+
+    Args:
+        project_path (str): 분석할 프로젝트의 루트 디렉토리 절대 경로.
+
+    Returns:
+        Dict[str, Any]: {"python_versions": Optional[List[str]], "has_uv_lock": bool} 형태의 딕셔너리.
+    """
+    py_ver = None
+    
+    # 1. Check .python-version
+    python_version_file = os.path.join(project_path, ".python-version")
+    if os.path.exists(python_version_file):
+        try:
+            with open(python_version_file, "r", encoding="utf-8") as f:
+                ver_str = f.read().strip()
+            # major.minor 버전만 추출 (예: "3.12.3" -> "3.12")
+            m = re.match(r'^(\d+\.\d+)', ver_str)
+            if m:
+                py_ver = [m.group(1)]
+        except Exception:
+            pass
+            
+    # 2. Check pyproject.toml if .python-version wasn't found or was invalid
+    if not py_ver:
+        toml_path = os.path.join(project_path, "pyproject.toml")
+        if os.path.exists(toml_path):
+            try:
+                with open(toml_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    
+                match = re.search(r'requires-python\s*=\s*["\']([^"\']+)["\']', content)
+                if match:
+                    constraint = match.group(1)
+                    found_vers = []
+                    for v in ["3.9", "3.10", "3.11", "3.12", "3.13"]:
+                        # Support multiple comma-separated constraints, e.g., ">=3.12,<3.14"
+                        parts = [p.strip() for p in constraint.split(",")]
+                        satisfied = True
+                        for part in parts:
+                            match_op = re.match(r'^([>=<~!]+)?\s*(\d+\.\d+)', part)
+                            if match_op:
+                                op, ver_num = match_op.groups()
+                                op = op or "=="
+                                try:
+                                    v_num = float(v)
+                                    ref_num = float(ver_num)
+                                    if op == ">=":
+                                        if not (v_num >= ref_num): satisfied = False
+                                    elif op == ">":
+                                        if not (v_num > ref_num): satisfied = False
+                                    elif op == "==":
+                                        if not (v_num == ref_num): satisfied = False
+                                    elif op == "~=":
+                                        if not (v_num >= ref_num and int(v_num) == int(ref_num)): satisfied = False
+                                    elif op == "<=":
+                                        if not (v_num <= ref_num): satisfied = False
+                                    elif op == "<":
+                                        if not (v_num < ref_num): satisfied = False
+                                except ValueError:
+                                    pass
+                        if satisfied:
+                            found_vers.append(v)
+                    if found_vers:
+                        py_ver = found_vers
+            except Exception:
+                pass
+        
+    return {
+        "python_versions": py_ver,
+        "has_uv_lock": os.path.exists(os.path.join(project_path, "uv.lock"))
+    }
+
+def get_platform_info(target_os: str, target_arch: str) -> Dict[str, str]:
+    """
+    지정된 대상 OS 및 아키텍처에 기반한 빌드 및 설치용 플랫폼 상세 정보를 반환합니다.
+
+    Args:
+        target_os (str): 대상 운영체제 ("windows" 또는 "linux").
+        target_arch (str): 대상 아키텍처 ("x86_64" 또는 "aarch64").
+
+    Returns:
+        Dict[str, str]: uv 아카이브 확장자(uv_ext), uv 트리플(uv_triple), python 트리플(pbp_triple), pip 플랫폼(pip_platform)을 포함하는 정보 딕셔너리.
     """
     info = {}
     if target_os == "windows":
@@ -49,9 +137,12 @@ def get_platform_info(target_os, target_arch):
             info["pip_platform"] = "manylinux2014_aarch64"
     return info
 
-def is_docker_available():
+def is_docker_available() -> bool:
     """
-    Checks if Docker command is available and the daemon is running.
+    시스템에 Docker 명령어가 설치되어 있고 데몬이 기동 중인지 확인합니다.
+
+    Returns:
+        bool: Docker 사용 가능 시 True, 불가능 시 False 반환.
     """
     if not shutil.which("docker"):
         return False
@@ -61,10 +152,24 @@ def is_docker_available():
     except Exception:
         return False
 
-def get_python_asset_url(py_ver, plat, log_callback, stripped=False):
+def get_python_asset_url(
+    py_ver: str,
+    plat: Dict[str, str],
+    log_callback: Callable[[str], None],
+    stripped: bool = False
+) -> Tuple[str, str]:
     """
-    Dynamically finds the python-build-standalone download URL by querying GitHub API
-    with a stable fallback map for rate-limited cases.
+    python-build-standalone 리포지토리의 최신 릴리스에서 플랫폼에 최적화된 Python 배포판 다운로드 URL을 탐색합니다.
+    GitHub API를 우선 호출하고, API 호출 횟수 초과(Rate Limit) 등의 실패 시 안정적인 fallback 버전을 반환합니다.
+
+    Args:
+        py_ver (str): 대상 파이썬 메이저.마이너 버전 (예: "3.11").
+        plat (Dict[str, str]): get_platform_info의 결과 플랫폼 정보 딕셔너리.
+        log_callback (Callable[[str], None]): 로그 출력 콜백 함수.
+        stripped (bool, optional): 임베디드용 가벼운 빌드(stripped) 여부. Defaults to False.
+
+    Returns:
+        Tuple[str, str]: (다운로드 URL, 아카이브파일명) 튜플.
     """
     suffix = "install_only_stripped.tar.gz" if stripped else "install_only.tar.gz"
     
@@ -114,10 +219,39 @@ def get_python_asset_url(py_ver, plat, log_callback, stripped=False):
     url = f"https://github.com/astral-sh/python-build-standalone/releases/download/{tag}/{archive_name}"
     return url, archive_name
 
-def build_package(target_os, target_arch, uv_version, python_versions, pip_packages, output_zip_path, log_callback, progress_callback, package_scope="all", ssl_bypass="standard"):
+def build_package(
+    target_os: str,
+    target_arch: str,
+    uv_version: str,
+    python_versions: List[str],
+    pip_packages: List[str],
+    output_zip_path: str,
+    log_callback: Callable[[str], None],
+    progress_callback: Callable[[int], None],
+    package_scope: str = "all",
+    ssl_bypass: str = "standard",
+    project_path: Optional[str] = None
+) -> bool:
     """
-    Builds the offline package zip containing uv, python standalone tarballs, and wheels.
-    Implements local caching to avoid re-downloading existing files.
+    uv 실행 바이너리, 독립형 Python 실행본 tarball, 지정된 라이브러리 wheel 파일들을 포함하는
+    폐쇄망 오프라인 설치 패키지 압축파일(.zip)을 생성합니다.
+    불필요한 다운로드를 줄이기 위해 로컬 `cache/` 디렉토리를 활용하여 다운로드 파일을 캐싱합니다.
+
+    Args:
+        target_os (str): 대상 운영체제 ("windows", "linux").
+        target_arch (str): 대상 아키텍처 ("x86_64", "aarch64").
+        uv_version (str): 빌드에 동봉할 uv 버전 정보.
+        python_versions (List[str]): 포함할 Python 버전 목록.
+        pip_packages (List[str]): 추가로 반입할 pip 패키지 목록.
+        output_zip_path (str): 결과물 zip 파일의 저장 경로.
+        log_callback (Callable[[str], None]): 빌드 진행 과정 로그 수신 콜백 함수.
+        progress_callback (Callable[[int], None]): 진행율 퍼센트 수신 콜백 함수.
+        package_scope (str, optional): 휠 수집 대상 범위 ("all", "new_only"). Defaults to "all".
+        ssl_bypass (str, optional): SSL 필터 우회 수준 ("standard", "trusted_host", "system_certs"). Defaults to "standard".
+        project_path (Optional[str], optional): 로컬 동기화 프로젝트 디렉토리 경로. Defaults to None.
+
+    Returns:
+        bool: 패키지 빌드 최종 성공 시 True 반환.
     """
     # Workspace and Cache Paths
     workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -161,7 +295,7 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                     uv_url = f"https://github.com/astral-sh/uv/releases/download/{uv_version}/{uv_archive_name}"
                     
                 log_callback(f"[DOWNLOAD] 캐시에 파일이 없어 새로 다운로드합니다. ({uv_url})")
-                download_file(uv_url, uv_cache_path, status_callback=log_callback)
+                download_file(uv_url, uv_cache_path, status_callback=log_callback, ssl_bypass=ssl_bypass)
                 shutil.copy2(uv_cache_path, uv_dest)
                 log_callback(f"[SUCCESS] uv 바이너리 다운로드 완료 및 캐싱: {uv_archive_name}")
         else:
@@ -185,7 +319,7 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                 else:
                     log_callback(f"[DOWNLOAD] 캐시에 파일이 없어 새로 다운로드합니다. ({pbp_url})")
                     try:
-                        download_file(pbp_url, pbp_cache_path, status_callback=log_callback)
+                        download_file(pbp_url, pbp_cache_path, status_callback=log_callback, ssl_bypass=ssl_bypass)
                         shutil.copy2(pbp_cache_path, pbp_dest)
                         log_callback(f"[SUCCESS] Python {py_ver} 다운로드 완료 및 캐싱.")
                     except Exception as e:
@@ -201,7 +335,7 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                             shutil.copy2(pbp_cache_path_s, pbp_dest_s)
                         else:
                             log_callback(f"[DOWNLOAD] stripped Python 다운로드 중: {pbp_url_s}")
-                            download_file(pbp_url_s, pbp_cache_path_s, status_callback=log_callback)
+                            download_file(pbp_url_s, pbp_cache_path_s, status_callback=log_callback, ssl_bypass=ssl_bypass)
                             shutil.copy2(pbp_cache_path_s, pbp_dest_s)
                             log_callback(f"[SUCCESS] Python {py_ver} (stripped) 다운로드 완료 및 캐싱.")
         else:
@@ -209,10 +343,15 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                         
         # 4. Download PIP Package wheels (with caching & new file tracking)
         progress_callback(60)
-        if pip_packages:
+        has_project = bool(project_path and os.path.exists(os.path.join(project_path, "pyproject.toml")))
+        if pip_packages or has_project:
             wheels_dir = os.path.join(payload_dir, "wheels")
             os.makedirs(wheels_dir)
-            log_callback(f"[INFO] PIP 패키지 {len(pip_packages)}개 수집 및 의존성 다운로드 시작...")
+            
+            if has_project:
+                log_callback("[INFO] 프로젝트 설정 감지: pyproject.toml 및 uv.lock(있는 경우)을 수집 소스로 사용합니다.")
+            else:
+                log_callback(f"[INFO] PIP 패키지 {len(pip_packages)}개 수집 및 의존성 다운로드 시작...")
             
             # Helper to calculate SHA-256 hash of a file
             def calculate_sha256(filepath):
@@ -232,11 +371,40 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                 except Exception as e:
                     log_callback(f"[WARNING] 휠 레지스트리 파일을 읽는 데 실패했습니다: {e}. 새로 생성합니다.")
             
-            # Write packages to temporary requirements.txt
+            # Write packages to temporary requirements.txt or compile pyproject.toml/uv.lock
             req_file_path = os.path.join(temp_dir, "requirements.txt")
-            with open(req_file_path, "w", encoding="utf-8") as rf:
-                for pkg in pip_packages:
-                    rf.write(f"{pkg}\n")
+            docker_req_path = "/temp/requirements.txt"
+            
+            if has_project:
+                has_lock = os.path.exists(os.path.join(project_path, "uv.lock"))
+                if has_lock:
+                    log_callback("[INFO] uv.lock 파일이 감지되어 uv export를 통해 requirements.txt를 내보냅니다.")
+                    compile_cmd = ["uv", "export", "--no-hashes", "-o", req_file_path]
+                else:
+                    log_callback("[INFO] pyproject.toml 파일을 분석하여 requirements.txt를 컴파일 중...")
+                    compile_cmd = ["uv", "pip", "compile", "pyproject.toml", "-o", req_file_path]
+                
+                # Apply SSL configurations to compilation environment if needed
+                compile_env = os.environ.copy()
+                if ssl_bypass == "system_certs":
+                    compile_env["UV_SYSTEM_CERTS"] = "1"
+                    compile_env["UV_NATIVE_TLS"] = "1"
+                    compile_cmd.append("--system-certs")
+                elif ssl_bypass == "trusted_host":
+                    compile_env["UV_INSECURE"] = "1"
+                    # Do not append "--insecure" since it is not a valid uv argument
+                
+                # Run uv pip compile / uv export
+                try:
+                    res = subprocess.run(compile_cmd, env=compile_env, cwd=project_path, capture_output=True, text=True, check=True)
+                    log_callback("[SUCCESS] 프로젝트 의존성 컴파일 완료.")
+                except subprocess.CalledProcessError as compile_err:
+                    log_callback(f"[ERROR] 프로젝트 의존성 컴파일 실패: {compile_err.stderr}")
+                    raise compile_err
+            else:
+                with open(req_file_path, "w", encoding="utf-8") as rf:
+                    for pkg in pip_packages:
+                        rf.write(f"{pkg}\n")
                     
             for py_ver in python_versions:
                 log_callback(f"[INFO] Python {py_ver} 버전에 맞는 wheel 패키지 분석 및 다운로드 중 (캐시 활용)...")
@@ -245,7 +413,7 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                 use_docker = (target_os == "linux" and is_docker_available())
                 
                 if use_docker:
-                    log_callback("[INFO] Docker 가용 상태가 감지되었습니다. 리눅스 휠 다운로드를 위해 Docker 컨테이너를 구동합니다.")
+                    log_callback("[INFO] Docker 가용 상태가 감지되었습니다. 리눅스 휠 빌드를 위해 Docker 컨테이너를 구동합니다. (sdist 자동 컴파일)")
                     abs_wheels_dir = os.path.abspath(wheels_dir)
                     abs_temp_dir = os.path.abspath(temp_dir)
                     abs_pip_cache = os.path.abspath(pip_cache_dir)
@@ -256,22 +424,16 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                     
                     image_tag = f"python:{py_ver}-slim"
                     
+                    # Use 'pip wheel' inside docker container to automatically compile sdist to whl
                     container_cmd = [
-                        "pip", "download",
-                        "--only-binary=:all:",
-                        "--dest", "/wheels",
+                        "pip", "wheel",
+                        "--wheel-dir", "/wheels",
                         "--cache-dir", "/cache",
-                        "-r", "/temp/requirements.txt"
+                        "-r", docker_req_path
                     ]
                     
-                    if ssl_bypass == "system_certs":
+                    if ssl_bypass == "system_certs" or ssl_bypass == "trusted_host":
                         log_callback("[WARNING] Docker 내부 빌드 시 OS 신뢰 저장소 옵션이 제한되므로, 도메인 신뢰 강제(--trusted-host) 방식으로 우회 다운로드합니다.")
-                        container_cmd.extend([
-                            "--trusted-host", "pypi.org",
-                            "--trusted-host", "files.pythonhosted.org",
-                            "--trusted-host", "pypi.python.org"
-                        ])
-                    elif ssl_bypass == "trusted_host":
                         container_cmd.extend([
                             "--trusted-host", "pypi.org",
                             "--trusted-host", "files.pythonhosted.org",
@@ -288,39 +450,66 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                     
                     sub_env = os.environ.copy()
                 else:
-                    if target_os == "linux":
-                        log_callback("[WARNING] 리눅스 타겟 빌드이나 Docker를 사용할 수 없습니다. 윈도우 호스트에서 교차 다운로드(Cross-platform)를 실행합니다.")
+                    host_os = "windows" if sys.platform == "win32" else "linux"
+                    if target_os == host_os:
+                        log_callback(f"[INFO] 호스트 OS와 타겟 OS가 일치하여, Python {py_ver} 환경에서 직접 휠 빌드(pip wheel)를 실행합니다. (sdist 자동 컴파일)")
+                        cmd = [
+                            "uv", "run", "--python", py_ver, "--with", "pip", "python", "-m", "pip", "wheel",
+                            "--wheel-dir", wheels_dir,
+                            "--cache-dir", pip_cache_dir,
+                            "-r", req_file_path
+                        ]
                         
-                    abi_tag = f"cp{py_ver.replace('.', '')}"
-                    
-                    cmd = [
-                        "uv", "run", "--with", "pip", "python", "-m", "pip", "download",
-                        "--only-binary=:all:",
-                        "--dest", wheels_dir,
-                        "--cache-dir", pip_cache_dir,
-                        "--platform", plat["pip_platform"],
-                        "--python-version", py_ver,
-                        "--implementation", "cp",
-                        "--abi", abi_tag,
-                        "-r", req_file_path
-                    ]
-                    
-                    sub_env = os.environ.copy()
-                    
-                    if ssl_bypass == "system_certs":
-                        log_callback("[INFO] SSL 우회: OS 신뢰 저장소(System Certs) 인증 수단을 적용합니다.")
-                        sub_env["UV_SYSTEM_CERTS"] = "1"
-                        sub_env["UV_NATIVE_TLS"] = "1"
-                        cmd.extend(["--use-feature=truststore"])
-                    elif ssl_bypass == "trusted_host":
-                        log_callback("[INFO] SSL 우회: PyPI 주요 도메인을 강제 신뢰(--trusted-host)합니다.")
-                        cmd.extend([
-                            "--trusted-host", "pypi.org",
-                            "--trusted-host", "files.pythonhosted.org",
-                            "--trusted-host", "pypi.python.org"
-                        ])
+                        sub_env = os.environ.copy()
+                        
+                        if ssl_bypass == "system_certs":
+                            log_callback("[INFO] SSL 우회: OS 신뢰 저장소(System Certs) 인증 수단을 적용합니다.")
+                            sub_env["UV_SYSTEM_CERTS"] = "1"
+                            sub_env["UV_NATIVE_TLS"] = "1"
+                            cmd.append("--use-feature=truststore")
+                        elif ssl_bypass == "trusted_host":
+                            log_callback("[INFO] SSL 우회: PyPI 주요 도메인을 강제 신뢰(--trusted-host)합니다.")
+                            sub_env["UV_INSECURE"] = "1"
+                            cmd.extend([
+                                "--trusted-host", "pypi.org",
+                                "--trusted-host", "files.pythonhosted.org",
+                                "--trusted-host", "pypi.python.org"
+                            ])
+                        else:
+                            log_callback("[INFO] SSL 우회: 표준 다운로드 모드를 사용합니다.")
                     else:
-                        log_callback("[INFO] SSL 우회: 표준 다운로드 모드를 사용합니다.")
+                        if target_os == "linux":
+                            log_callback("[WARNING] 리눅스 타겟 빌드이나 Docker를 사용할 수 없습니다. 윈도우 호스트에서 교차 다운로드(Cross-platform)를 실행합니다.")
+                        abi_tag = f"cp{py_ver.replace('.', '')}"
+                        cmd = [
+                            "uv", "run", "--with", "pip", "python", "-m", "pip", "download",
+                            "--only-binary=:all:",
+                            "--dest", wheels_dir,
+                            "--cache-dir", pip_cache_dir,
+                            "--platform", plat["pip_platform"],
+                            "--python-version", py_ver,
+                            "--implementation", "cp",
+                            "--abi", abi_tag,
+                            "-r", req_file_path
+                        ]
+                        
+                        sub_env = os.environ.copy()
+                        
+                        if ssl_bypass == "system_certs":
+                            log_callback("[INFO] SSL 우회: OS 신뢰 저장소(System Certs) 인증 수단을 적용합니다.")
+                            sub_env["UV_SYSTEM_CERTS"] = "1"
+                            sub_env["UV_NATIVE_TLS"] = "1"
+                            cmd.append("--use-feature=truststore")
+                        elif ssl_bypass == "trusted_host":
+                            log_callback("[INFO] SSL 우회: PyPI 주요 도메인을 강제 신뢰(--trusted-host)합니다.")
+                            sub_env["UV_INSECURE"] = "1"
+                            cmd.extend([
+                                "--trusted-host", "pypi.org",
+                                "--trusted-host", "files.pythonhosted.org",
+                                "--trusted-host", "pypi.python.org"
+                            ])
+                        else:
+                            log_callback("[INFO] SSL 우회: 표준 다운로드 모드를 사용합니다.")
                 
                 log_callback(f"[CMD] {' '.join(cmd)}")
                 
@@ -351,7 +540,8 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                 if process.returncode == 0:
                     log_callback(f"[SUCCESS] Python {py_ver} 용 패키지 라이브러리 수집 완료.")
                 else:
-                    log_callback(f"[WARNING] Python {py_ver} 용 패키지 수집 중 경고/에러가 발생했습니다 (코드: {process.returncode}).")
+                    log_callback(f"[ERROR] Python {py_ver} 용 패키지 수집 중 경고/에러가 발생했습니다 (코드: {process.returncode}).")
+                    raise RuntimeError(f"Python {py_ver} 용 패키지 수집에 실패했습니다. (코드: {process.returncode})")
             
             # Scan wheels_dir and compare with registry
             newly_downloaded_wheels = []
@@ -408,87 +598,30 @@ def build_package(target_os, target_arch, uv_version, python_versions, pip_packa
                 except Exception as e:
                     log_callback(f"[WARNING] 휠 레지스트리 저장 실패: {e}")
 
-
-                    
-        # 5. Copy Launchers / Install scripts
+        # 5. Packaging Wheels Only
         progress_callback(85)
-        log_callback("[INFO] 오프라인 설치 스크립트 및 런처 배치 중...")
-
-        # Generate install_offline.ps1 for Windows targets (offline replacement for uv install.ps1)
-        if target_os == "windows":
-            from .ps1_generator import generate_install_ps1
-            ps1_content = generate_install_ps1()
-            ps1_dest = os.path.join(temp_dir, "install_offline.ps1")
-            with open(ps1_dest, "w", encoding="utf-8-sig") as f:
-                f.write(ps1_content)
-            log_callback("[INFO] install_offline.ps1 생성 완료 (irm https://astral.sh/uv/install.ps1 | iex 대체품)")
-        
-        # Check and copy compiled installer if exists (from dist directory or embedded resource)
-        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            # Embedded resource inside builder_gui.exe
-            installer_exe_source = os.path.join(sys._MEIPASS, "installer_gui.exe")
-            log_callback(f"[INFO] PyInstaller 임시 경로에서 embedded installer_gui.exe를 로드합니다: {installer_exe_source}")
-        else:
-            # Running as source code
-            dist_dir = os.path.join(workspace_dir, "dist")
-            installer_exe_source = os.path.join(dist_dir, "installer_gui.exe")
-            if not os.path.exists(installer_exe_source):
-                installer_exe_source = os.path.join(dist_dir, "installer_gui", "installer_gui.exe")
+        log_callback("[INFO] 압축 팩에 포함될 최종 수집 및 컴파일된 휠(*.whl) 패키지 목록:")
+        wheel_list = []
+        if os.path.exists(wheels_dir):
+            for file in sorted(os.listdir(wheels_dir)):
+                if file.endswith('.whl'):
+                    wheel_list.append(file)
+                    log_callback(f"  -> [수집됨] {file}")
             
-        if target_os == "windows":
-            # Copy Windows scripts
-            install_bat_dest = os.path.join(temp_dir, "install.bat")
-            with open(install_bat_dest, "w", encoding="euc-kr") as f:
-                f.write("@echo off\n")
-                f.write("echo [uvtool] 오프라인 설치기를 실행하는 중...\n")
-                if os.path.exists(installer_exe_source):
-                    f.write("start \"\" \"%~dp0installer_gui.exe\"\n")
-                else:
-                    f.write("echo [WARNING] 컴파일된 installer_gui.exe를 찾을 수 없습니다. python 스크립트로 실행을 시도합니다.\n")
-                    f.write("python \"%~dp0installer_gui.py\" 2>nul || python.exe \"%~dp0installer_gui.py\"\n")
-                    f.write("if %errorlevel% neq 0 (\n")
-                    f.write("    echo [ERROR] Python이 설치되어 있지 않거나 실행할 수 없습니다.\n")
-                    f.write("    pause\n")
-                    f.write(")\n")
-                    
-            # If installer_exe exists, copy it. Else, copy python source files.
-            if os.path.exists(installer_exe_source):
-                shutil.copy2(installer_exe_source, os.path.join(temp_dir, "installer_gui.exe"))
-                log_callback("[INFO] 컴파일된 installer_gui.exe 파일을 패키지에 번들링했습니다.")
-            else:
-                log_callback("[WARNING] dist 폴더에 빌드된 installer_gui.exe를 찾을 수 없어, 파이썬 소스 코드(.py) 형태로 번들링합니다.")
-                # Copy python source files and subfolder structure
-                shutil.copytree(
-                    os.path.join(workspace_dir, "src"),
-                    os.path.join(temp_dir, "src"),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
-                )
-                shutil.copy2(
-                    os.path.join(workspace_dir, "installer_gui.py"),
-                    os.path.join(temp_dir, "installer_gui.py")
-                )
-        else:
-            # Copy Linux shell script installer
-            install_sh_dest = os.path.join(temp_dir, "install.sh")
-            write_linux_install_script(install_sh_dest)
-            log_callback("[INFO] 리눅스용 install.sh 설치 쉘 스크립트를 생성했습니다.")
-            
-        # 6. Compress everything to output_zip_path
+        # 6. Compress wheels directly to the root of output_zip_path
         progress_callback(90)
-        log_callback(f"[INFO] 최종 오프라인 패키지 압축 파일 작성 중: {os.path.basename(output_zip_path)}")
+        log_callback(f"[INFO] 최종 오프라인 패키지 압축 파일 작성 중 (포함된 휠 개수: {len(wheel_list)}개): {os.path.basename(output_zip_path)}")
         
         # Ensure target folder exists
         os.makedirs(os.path.dirname(os.path.abspath(output_zip_path)), exist_ok=True)
         
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, temp_dir)
-                    zipf.write(file_path, arcname)
+            for file in wheel_list:
+                file_path = os.path.join(wheels_dir, file)
+                zipf.write(file_path, file)
                     
         progress_callback(100)
-        log_callback(f"[SUCCESS] 오프라인 패키지 빌드 완료: {output_zip_path}")
+        log_callback(f"[SUCCESS] 오프라인 동기화용 패키지 빌드 완료 (저장 경로: {output_zip_path})")
         
         # Check size for 2GB corporate proxy / network transmission limits
         zip_size = os.path.getsize(output_zip_path)

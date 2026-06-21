@@ -96,6 +96,28 @@ DPI 프록시, SSL 감시 장비가 있는 환경을 위해 3가지 다운로드
 CPython Standalone + uv 바이너리를 다운로드하여 USB 이동용 폴더를 자동 생성합니다.  
 `run_installer.bat` 한 번으로 폐쇄망 PC에서 실행 가능합니다.
 
+### 폐쇄망에서 pyproject.toml 및 uv.lock 기반 동기화 (uv sync)
+
+빌더 단계에서 프로젝트 디렉토리(`pyproject.toml` 및 `uv.lock`이 위치한 경로)를 지정하고 빌드하면, 해당 프로젝트에서 요구하는 Python standalone 바이너리와 필요한 모든 오프라인 wheels 패키지가 압축 팩에 번들링됩니다.
+
+폐쇄망 PC에서 해당 프로젝트의 가상환경을 구축하고 동일하게 싱크하려면 다음 명령을 수동으로 수행합니다.
+
+1. **CPython standalone 인터프리터를 사용하여 가상환경(venv) 생성**:
+   ```powershell
+   # 설치된 CPython standalone 절대 경로를 지정하여 가상환경을 생성합니다.
+   # (예: C:\Users\<사용자명>\.local\python\3.11\python.exe)
+   uv venv --python <설치경로>/python/<버전>/python.exe
+   ```
+
+2. **오프라인 휠 라이브러리를 참조하여 프로젝트 패키지 동기화**:
+   ```powershell
+   # 가상환경이 생성된 프로젝트 폴더 내에서 실행합니다.
+   # --offline: 네트워크 통신 완전 차단
+   # --no-index: PyPI 인덱스 조회 배제
+   # --find-links: 반입된 wheels 폴더 경로를 패키지 소스로 사용
+   uv sync --offline --no-index --find-links <설치경로>/wheels
+   ```
+
 ---
 
 ## 설치 후 환경 구성

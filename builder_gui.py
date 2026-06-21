@@ -1,430 +1,654 @@
+import json
 import os
+import re
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from src.builder import build_package
+from tkinter import filedialog, messagebox
+from typing import Any, Dict, List, Optional
 
-class BuilderApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("uvtool - 오프라인 패키지 빌더 (Builder)")
-        self.root.geometry("750x700")
-        self.root.minsize(680, 600)
-        
-        # UI Styling Colors (Toss White/Blue Minimal Style)
-        self.bg_color = "#F2F4F6"      # Toss Light Background
-        self.card_color = "#FFFFFF"    # Crisp White Cards
-        self.fg_color = "#191F28"      # Toss Dark Grey Text
-        self.fg_muted = "#6B7684"      # Toss Muted Gray Text
-        self.accent_color = "#0064FF"    # Toss Vibrant Blue Accent
-        self.error_color = "#F04452"     # Toss Red
-        self.success_color = "#00D4B2"   # Toss Teal/Green
-        self.console_bg = "#191F28"     # Toss Dark Grey console background
-        
-        # Configure Root Styles
-        self.root.configure(bg=self.bg_color)
-        
-        # Create ttk style mapping
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.style.configure('.', background=self.bg_color, foreground=self.fg_color)
-        self.style.configure('TLabel', background=self.bg_color, foreground=self.fg_color)
-        self.style.configure('Card.TFrame', background=self.card_color, relief="flat")
-        self.style.configure('Accent.TButton', background=self.accent_color, foreground="#FFFFFF", borderwidth=0, font=("Malgun Gothic", 10, "bold"))
-        self.style.map('Accent.TButton', background=[('active', '#0052CC')])
-        self.style.configure('TProgressbar', thickness=8, troughcolor=self.bg_color, background=self.accent_color, borderwidth=0)
-        self.style.configure('Vertical.TScrollbar', arrowsize=0, width=8, relief='flat', borderwidth=0,
-                             troughcolor=self.bg_color, background='#C5CAD2')
-        self.style.map('Vertical.TScrollbar', background=[('active', '#6B7684'), ('pressed', '#4B5563')])
-        
-        self.setup_ui()
-        
-    def setup_ui(self):
-        # 1. Header Frame
-        header_frame = tk.Frame(self.root, bg=self.bg_color, pady=15)
-        header_frame.pack(fill=tk.X, padx=25)
-        
-        title_label = tk.Label(
-            header_frame, 
-            text="uv 오프라인 패키지 빌더", 
-            font=("Malgun Gothic", 20, "bold"), 
-            bg=self.bg_color, 
-            fg=self.fg_color
+try:
+    import customtkinter as ctk  # type: ignore
+except ImportError:
+    import subprocess
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter"])
+        import customtkinter as ctk  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "customtkinter 모듈을 가져올 수 없으며 자동 설치에 실패했습니다. "
+            f"터미널에서 'pip install customtkinter'을 실행하여 설치해주십시오. (에러: {e})"
         )
-        title_label.pack(anchor=tk.W)
-        
-        subtitle_label = tk.Label(
-            header_frame, 
-            text="인터넷 환경에서 uv, Python Standalone, PIP 패키지를 수집하여 오프라인 설치 팩을 빌드합니다.", 
-            font=("Malgun Gothic", 10), 
-            bg=self.bg_color, 
-            fg=self.fg_muted
-        )
-        subtitle_label.pack(anchor=tk.W, pady=3)
-        
-        # Scrollable Main Canvas/Frame for contents
-        main_canvas = tk.Canvas(self.root, bg=self.bg_color, highlightthickness=0)
-        main_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
-        scrollable_frame = tk.Frame(main_canvas, bg=self.bg_color)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
-        )
-        
-        canvas_window_id = main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        main_canvas.configure(yscrollcommand=main_scrollbar.set)
 
-        def on_canvas_resize(e):
-            main_canvas.itemconfig(canvas_window_id, width=e.width)
-        main_canvas.bind("<Configure>", on_canvas_resize)
+from src.builder import build_package, detect_project_settings
 
-        def _on_mousewheel(event):
-            main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+# Configure global theme styling
+ctk.set_appearance_mode("System")  # Options: "System", "Dark", "Light"
+ctk.set_default_color_theme("blue")  # Themes: "blue", "green", "dark-blue"
 
-        main_canvas.pack(side="left", fill="both", expand=True, padx=(25, 0))
-        main_scrollbar.pack(side="right", fill="y")
+# Premium, commercially free modern font fallback stack
+def _resolve_font() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import font
+        root = tk.Tk()
+        root.withdraw()
+        families = font.families()
+        root.destroy()
+        # 선호하는 모던 폰트 리스트 순회 매핑
+        for f in ["Pretendard", "Noto Sans KR", "Segoe UI Variable Text", "Segoe UI", "Malgun Gothic"]:
+            if f in families:
+                return f
+    except Exception:
+        pass
+    return "Segoe UI"
+
+FONT_FAMILY = _resolve_font()
+
+
+class BuilderApp(ctk.CTk):
+    """
+    uvtool 오프라인 패키지 빌더 GUI 애플리케이션 클래스입니다.
+    사용자가 원하는 대상 OS, 아키텍처, 파이썬 버전 및 추가 라이브러리를 지정하여
+    폐쇄망용 오프라인 압축 패키지를 빌드할 수 있는 화면을 제공합니다.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
         
-        # 2. Main Form Card (Modern Border with High Contrast Card Layout)
-        form_card = tk.Frame(
-            scrollable_frame, bg=self.card_color, 
-            highlightthickness=1, highlightbackground="#E5E8EB", bd=0
-        )
-        form_card.pack(fill=tk.X, pady=10, padx=5)
+        self.title("uvtool - 오프라인 패키지 빌더 (Builder)")
+        self.geometry("900x750")
+        self.minsize(800, 650)
         
-        # Inner Padding Wrapper
-        form_card_inner = tk.Frame(form_card, bg=self.card_color)
-        form_card_inner.pack(fill=tk.X, padx=24, pady=24)
+        # Color configuration (Toss Minimal / Slate Theme)
+        self.accent_color = "#0064FF"  # Toss Blue
         
-        # Target OS & Arch Selector (Segmented Flat Buttons)
-        target_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        target_frame.pack(fill=tk.X, pady=5)
-        
-        os_label = tk.Label(target_frame, text="대상 운영체제 (Target OS)", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        os_label.pack(anchor=tk.W, pady=(0, 5))
-        
-        os_btn_frame = tk.Frame(target_frame, bg=self.card_color)
-        os_btn_frame.pack(anchor=tk.W, pady=5)
-        
+        # UI State variables
         self.target_os_var = tk.StringVar(value="windows")
-        self.os_win_btn = tk.Button(
-            os_btn_frame, text="Windows", command=lambda: self.toggle_os("windows"),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=18, pady=6,
-            bg=self.accent_color, fg="#FFFFFF"
-        )
-        self.os_win_btn.pack(side=tk.LEFT, padx=(0, 8))
-        
-        self.os_lin_btn = tk.Button(
-            os_btn_frame, text="Linux", command=lambda: self.toggle_os("linux"),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=18, pady=6,
-            bg="#E5E8EB", fg=self.fg_muted
-        )
-        self.os_lin_btn.pack(side=tk.LEFT)
-        
-        # Arch
-        arch_label = tk.Label(target_frame, text="대상 아키텍처 (Arch)", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        arch_label.pack(anchor=tk.W, pady=(12, 5))
-        
-        arch_btn_frame = tk.Frame(target_frame, bg=self.card_color)
-        arch_btn_frame.pack(anchor=tk.W, pady=5)
-        
         self.target_arch_var = tk.StringVar(value="x86_64")
-        self.arch_64_btn = tk.Button(
-            arch_btn_frame, text="x86_64 (Intel/AMD)", command=lambda: self.toggle_arch("x86_64"),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=18, pady=6,
-            bg=self.accent_color, fg="#FFFFFF"
-        )
-        self.arch_64_btn.pack(side=tk.LEFT, padx=(0, 8))
-        
-        self.arch_arm_btn = tk.Button(
-            arch_btn_frame, text="aarch64 (ARM64)", command=lambda: self.toggle_arch("aarch64"),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=18, pady=6,
-            bg="#E5E8EB", fg=self.fg_muted
-        )
-        self.arch_arm_btn.pack(side=tk.LEFT)
-        
-        # Divider line
-        tk.Frame(form_card_inner, height=1, bg=self.bg_color).pack(fill=tk.X, pady=18)
-        
-        # Packaging Scope Selection (Toss Segmented Button UI)
-        scope_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        scope_frame.pack(fill=tk.X, pady=5)
-        
-        scope_label = tk.Label(scope_frame, text="압축 패키지 범위 (Package Scope)", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        scope_label.pack(anchor=tk.W, pady=(0, 5))
-        
-        scope_btn_frame = tk.Frame(scope_frame, bg=self.card_color)
-        scope_btn_frame.pack(anchor=tk.W, pady=5)
-        
         self.package_scope_var = tk.StringVar(value="all")
-        self.scope_all_btn = tk.Button(
-            scope_btn_frame, text="전체 패키지 압축 (Full)", command=lambda: self.toggle_scope("all"),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=18, pady=6,
-            bg=self.accent_color, fg="#FFFFFF"
-        )
-        self.scope_all_btn.pack(side=tk.LEFT, padx=(0, 8))
-        
-        self.scope_new_btn = tk.Button(
-            scope_btn_frame, text="신규 패키지만 압축 (Incremental)", command=lambda: self.toggle_scope("new"),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=18, pady=6,
-            bg="#E5E8EB", fg=self.fg_muted
-        )
-        self.scope_new_btn.pack(side=tk.LEFT)
-
-        # 신규패키지 기준 초기화 버튼
-        self.reset_registry_btn = tk.Button(
-            scope_btn_frame, text="🔄 신규패키지 기준 초기화",
-            command=self.reset_wheel_registry,
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=14, pady=6,
-            bg="#F04452", fg="#FFFFFF", activebackground="#C0392B", activeforeground="#FFFFFF"
-        )
-        self.reset_registry_btn.pack(side=tk.LEFT, padx=(16, 0))
-        
-        scope_help = tk.Label(scope_frame, text="증분 압축 시 uv 바이너리와 Python standalone은 제외되고 처음/변경 다운로드된 휠만 포함되어 압축 파일 용량이 아주 작아집니다.", font=("Malgun Gothic", 8), bg=self.card_color, fg=self.fg_muted)
-        scope_help.pack(anchor=tk.W, pady=(2, 0))
-        
-        # Divider line
-        tk.Frame(form_card_inner, height=1, bg=self.bg_color).pack(fill=tk.X, pady=18)
-        
-        # UV Version Input
-        uv_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        uv_frame.pack(fill=tk.X, pady=5)
-        uv_label = tk.Label(uv_frame, text="uv 버전 지정", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        uv_label.pack(anchor=tk.W, pady=(0, 5))
-        
-        self.uv_version_entry = tk.Entry(
-            uv_frame, bg="#E5E8EB", fg=self.fg_color, insertbackground=self.fg_color, 
-            bd=0, relief="flat", font=("Segoe UI", 10),
-            highlightthickness=1, highlightbackground="#E5E8EB", highlightcolor=self.accent_color
-        )
-        self.uv_version_entry.insert(0, "latest")
-        self.uv_version_entry.pack(fill=tk.X, pady=5, ipady=4)
-        uv_help = tk.Label(uv_frame, text="'latest' 또는 특정 버전(예: 0.11.16)을 입력하세요.", font=("Malgun Gothic", 8), bg=self.card_color, fg=self.fg_muted)
-        uv_help.pack(anchor=tk.W)
-        
-        # Divider line
-        tk.Frame(form_card_inner, height=1, bg=self.bg_color).pack(fill=tk.X, pady=18)
-        
-        # Python Versions Checkboxes (Toggle Buttons Tags)
-        py_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        py_frame.pack(fill=tk.X, pady=5)
-        py_label = tk.Label(py_frame, text="포함할 Python 버전 선택", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        py_label.pack(anchor=tk.W, pady=(0, 5))
-        
-        self.py_versions = ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        self.py_vars = {}
-        self.py_buttons = {}
-        
-        self.checkbox_frame = tk.Frame(py_frame, bg=self.card_color)
-        self.checkbox_frame.pack(fill=tk.X, pady=5)
-        
-        for idx, ver in enumerate(self.py_versions):
-            is_checked = (ver == "3.11")
-            var = tk.BooleanVar(value=is_checked)
-            self.py_vars[ver] = var
-            
-            btn = tk.Button(
-                self.checkbox_frame, text=f"Python {ver}", 
-                command=lambda v=ver: self.toggle_py_version(v),
-                font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=15, pady=6
-            )
-            btn.grid(row=0, column=idx, padx=4, pady=5)
-            self.py_buttons[ver] = btn
-            
-            if is_checked:
-                btn.configure(bg=self.accent_color, fg="#FFFFFF")
-            else:
-                btn.configure(bg="#E5E8EB", fg=self.fg_muted)
-            
-        # Custom python version input
-        custom_py_frame = tk.Frame(py_frame, bg=self.card_color)
-        custom_py_frame.pack(fill=tk.X, pady=8)
-        custom_label = tk.Label(custom_py_frame, text="기타 버전 직접 입력:", font=("Malgun Gothic", 9), bg=self.card_color, fg=self.fg_muted)
-        custom_label.pack(side=tk.LEFT, padx=(0, 8))
-        self.custom_py_entry = tk.Entry(
-            custom_py_frame, bg="#E5E8EB", fg=self.fg_color, insertbackground=self.fg_color, 
-            bd=0, relief="flat", width=15,
-            highlightthickness=1, highlightbackground="#E5E8EB", highlightcolor=self.accent_color
-        )
-        self.custom_py_entry.pack(side=tk.LEFT, padx=5, ipady=2)
-        
-        custom_add_btn = tk.Button(
-            custom_py_frame, text="추가", command=self.add_custom_python, 
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, bg="#E5E8EB", fg=self.fg_color,
-            cursor="hand2", padx=12, pady=2
-        )
-        custom_add_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Divider line
-        tk.Frame(form_card_inner, height=1, bg=self.bg_color).pack(fill=tk.X, pady=18)
-        
-        # PIP Packages Text Area
-        pip_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        pip_frame.pack(fill=tk.X, pady=5)
-        pip_label = tk.Label(pip_frame, text="포함할 PIP 라이브러리 목록 (requirements.txt 형식)", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        pip_label.pack(anchor=tk.W, pady=(0, 5))
-        
-        pip_text_frame = tk.Frame(pip_frame, bg="#E5E8EB",
-                                  highlightthickness=1, highlightbackground="#E5E8EB")
-        pip_text_frame.pack(fill=tk.X, pady=5)
-        pip_scroll = ttk.Scrollbar(pip_text_frame, orient="vertical")
-        self.pip_packages_text = tk.Text(
-            pip_text_frame, height=5, bg="#E5E8EB", fg=self.fg_color, insertbackground=self.fg_color,
-            bd=0, relief="flat", font=("Consolas", 10), wrap=tk.WORD,
-            highlightthickness=0, yscrollcommand=pip_scroll.set
-        )
-        pip_scroll.config(command=self.pip_packages_text.yview)
-        self.pip_packages_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        pip_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.pip_packages_text.insert(tk.END, "# 예: numpy\n# pandas>=2.0.0\n# requests")
-        
-        # Divider line
-        tk.Frame(form_card_inner, height=1, bg=self.bg_color).pack(fill=tk.X, pady=18)
-        
-        # Network/SSL Bypass Option (Radiobuttons)
-        ssl_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        ssl_frame.pack(fill=tk.X, pady=5)
-        ssl_label = tk.Label(ssl_frame, text="보안망/SSL 우회 옵션 지정", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        ssl_label.pack(anchor=tk.W, pady=(0, 5))
-        
         self.ssl_bypass_var = tk.StringVar(value="standard")
         
-        ssl_btn_frame = tk.Frame(ssl_frame, bg=self.card_color)
-        ssl_btn_frame.pack(anchor=tk.W, pady=5)
+        # Python Checkbox variables
+        self.py_versions = ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        self.py_vars = {}
+        self.py_checkboxes = {}
         
-        self.ssl_std_rb = tk.Radiobutton(
-            ssl_btn_frame, text="사용 안 함 (Standard)", variable=self.ssl_bypass_var, value="standard",
-            bg=self.card_color, fg=self.fg_color, activebackground=self.card_color, activeforeground=self.fg_color,
-            font=("Malgun Gothic", 9), selectcolor=self.card_color
+        for ver in self.py_versions:
+            self.py_vars[ver] = tk.BooleanVar(value=(ver == "3.11"))
+            
+        self.setup_ui()
+        
+    def setup_ui(self) -> None:
+        """
+        메인 윈도우 UI 레이아웃(좌측 사이드바 및 우측 메인 콘텐츠 프레임)을 구성합니다.
+        """
+        # Configure Grid Layout (1 row, 2 columns: Sidebar & Content)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        
+        # 1. Sidebar Frame
+        self.sidebar_frame = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(5, weight=1)  # spacer
+        
+        # Sidebar Logo Header
+        self.logo_label = ctk.CTkLabel(
+            self.sidebar_frame, 
+            text="uvtool Builder", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=20, weight="bold"),
+            text_color=self.accent_color
         )
-        self.ssl_std_rb.pack(side=tk.LEFT, padx=(0, 15))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(25, 5))
         
-        self.ssl_certs_rb = tk.Radiobutton(
-            ssl_btn_frame, text="OS 신뢰 저장소 사용 (--system-certs)", variable=self.ssl_bypass_var, value="system_certs",
-            bg=self.card_color, fg=self.fg_color, activebackground=self.card_color, activeforeground=self.fg_color,
-            font=("Malgun Gothic", 9), selectcolor=self.card_color
+        self.sub_logo_label = ctk.CTkLabel(
+            self.sidebar_frame, 
+            text="오프라인 패키지 빌더", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            text_color="gray"
         )
-        self.ssl_certs_rb.pack(side=tk.LEFT, padx=(0, 15))
+        self.sub_logo_label.grid(row=1, column=0, padx=20, pady=(0, 25))
         
-        self.ssl_hosts_rb = tk.Radiobutton(
-            ssl_btn_frame, text="도메인 신뢰 강제 (--trusted-host)", variable=self.ssl_bypass_var, value="trusted_host",
-            bg=self.card_color, fg=self.fg_color, activebackground=self.card_color, activeforeground=self.fg_color,
-            font=("Malgun Gothic", 9), selectcolor=self.card_color
+        # Sidebar Navigation Buttons
+        self.nav_btn_project = ctk.CTkButton(
+            self.sidebar_frame, text="프로젝트 동기화 설정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            anchor="w", fg_color="transparent", text_color=("gray10", "gray90"),
+            hover_color=("gray70", "gray30"), command=lambda: self.select_tab("project")
         )
-        self.ssl_hosts_rb.pack(side=tk.LEFT)
+        self.nav_btn_project.grid(row=2, column=0, padx=15, pady=8, sticky="ew")
         
-        ssl_help = tk.Label(ssl_frame, text="DPI 프록시나 보안망의 SSL 인증서 차단으로 인해 다운로드 실패 시 유용합니다.", font=("Malgun Gothic", 8), bg=self.card_color, fg=self.fg_muted)
-        ssl_help.pack(anchor=tk.W, pady=(2, 0))
+        self.nav_btn_settings = ctk.CTkButton(
+            self.sidebar_frame, text="고급 환경 설정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            anchor="w", fg_color="transparent", text_color=("gray10", "gray90"),
+            hover_color=("gray70", "gray30"), command=lambda: self.select_tab("settings")
+        )
+        self.nav_btn_settings.grid(row=3, column=0, padx=15, pady=8, sticky="ew")
         
-        # Divider line
-        tk.Frame(form_card_inner, height=1, bg=self.bg_color).pack(fill=tk.X, pady=18)
+        self.nav_btn_logs = ctk.CTkButton(
+            self.sidebar_frame, text="빌드 및 콘솔 로그", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            anchor="w", fg_color="transparent", text_color=("gray10", "gray90"),
+            hover_color=("gray70", "gray30"), command=lambda: self.select_tab("logs")
+        )
+        self.nav_btn_logs.grid(row=4, column=0, padx=15, pady=8, sticky="ew")
         
-        # Output Zip Path
-        out_frame = tk.Frame(form_card_inner, bg=self.card_color)
-        out_frame.pack(fill=tk.X, pady=5)
-        out_label = tk.Label(out_frame, text="저장할 패키지 압축파일 경로 (Output ZIP)", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        out_label.pack(anchor=tk.W, pady=(0, 5))
+        # Appearance Mode Controls at Sidebar Bottom
+        self.appearance_label = ctk.CTkLabel(
+            self.sidebar_frame, text="테마 모드 선택:", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold")
+        )
+        self.appearance_label.grid(row=6, column=0, padx=20, pady=(10, 5), sticky="w")
         
-        path_input_frame = tk.Frame(out_frame, bg=self.card_color)
-        path_input_frame.pack(fill=tk.X, pady=5)
+        self.appearance_menu = ctk.CTkOptionMenu(
+            self.sidebar_frame, values=["System", "Dark", "Light"],
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            command=self.change_appearance_mode
+        )
+        self.appearance_menu.grid(row=7, column=0, padx=20, pady=(0, 25), sticky="ew")
         
-        self.output_path_entry = tk.Entry(
-            path_input_frame, bg="#E5E8EB", fg=self.fg_color, insertbackground=self.fg_color, 
-            bd=0, relief="flat", font=("Segoe UI", 10),
-            highlightthickness=1, highlightbackground="#E5E8EB", highlightcolor=self.accent_color
+        # 2. Main Content Tab Views
+        self.content_frame_project = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="transparent")
+        self.content_frame_settings = ctk.CTkScrollableFrame(self, corner_radius=0, fg_color="transparent")
+        self.content_frame_logs = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        
+        # Setup specific frames
+        self.setup_project_tab()
+        self.setup_settings_tab()
+        self.setup_logs_tab()
+        
+        # Default view active
+        self.select_tab("project")
+        
+    def select_tab(self, name: str) -> None:
+        """
+        네비게이션 사이드바 클릭 시 해당하는 우측 서브 화면 탭으로 전환합니다.
+
+        Args:
+            name (str): 전환할 탭 이름 ("project", "settings", "logs").
+        """
+        # 모든 메인 콘텐츠 뷰 숨김
+        self.content_frame_project.grid_forget()
+        self.content_frame_settings.grid_forget()
+        self.content_frame_logs.grid_forget()
+        
+        # 네비게이션 버튼 스타일 초기화
+        self.nav_btn_project.configure(fg_color="transparent", text_color=("gray10", "gray90"))
+        self.nav_btn_settings.configure(fg_color="transparent", text_color=("gray10", "gray90"))
+        self.nav_btn_logs.configure(fg_color="transparent", text_color=("gray10", "gray90"))
+        
+        # 선택한 탭 표시 및 활성화 효과 적용
+        if name == "project":
+            self.content_frame_project.grid(row=0, column=1, sticky="nsew", padx=25, pady=25)
+            self.nav_btn_project.configure(fg_color=self.accent_color, text_color="#FFFFFF")
+        elif name == "settings":
+            self.content_frame_settings.grid(row=0, column=1, sticky="nsew", padx=25, pady=25)
+            self.nav_btn_settings.configure(fg_color=self.accent_color, text_color="#FFFFFF")
+        elif name == "logs":
+            self.content_frame_logs.grid(row=0, column=1, sticky="nsew", padx=25, pady=25)
+            self.nav_btn_logs.configure(fg_color=self.accent_color, text_color="#FFFFFF")
+
+    def change_appearance_mode(self, mode: str) -> None:
+        """
+        GUI 애플리케이션의 화면 테마 모드를 전환합니다.
+
+        Args:
+            mode (str): 설정할 테마 이름 ("System", "Dark", "Light").
+        """
+        ctk.set_appearance_mode(mode)
+        
+    def setup_project_tab(self) -> None:
+        """
+        '프로젝트 동기화 설정' 탭 화면 구성요소를 구축합니다.
+        """
+        # Tab Header
+        tab_header = ctk.CTkLabel(
+            self.content_frame_project, text="프로젝트 동기화 설정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=22, weight="bold"),
+            anchor="w"
+        )
+        tab_header.pack(fill="x", pady=(10, 5))
+        
+        tab_desc = ctk.CTkLabel(
+            self.content_frame_project, 
+            text="개발 프로젝트(pyproject.toml/uv.lock) 경로를 입력하면 버전을 자동 감지해 휠들을 모아줍니다.",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color="gray", anchor="w"
+        )
+        tab_desc.pack(fill="x", pady=(0, 20))
+        
+        # 1. Project Selector Card
+        project_card = ctk.CTkFrame(self.content_frame_project)
+        project_card.pack(fill="x", pady=10)
+        
+        project_title = ctk.CTkLabel(
+            project_card, text="프로젝트 디렉토리 경로 지정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        project_title.pack(anchor="w", padx=20, pady=(15, 8))
+        
+        input_frame = ctk.CTkFrame(project_card, fg_color="transparent")
+        input_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        self.project_path_entry = ctk.CTkEntry(
+            input_frame, placeholder_text="예: C:/Users/Documents/GitHub/myproject",
+            font=ctk.CTkFont(size=12)
+        )
+        self.project_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+        browse_btn = ctk.CTkButton(
+            input_frame, text="찾아보기...", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            width=100, command=self.browse_project
+        )
+        browse_btn.pack(side="left", padx=(0, 8))
+        
+        self.detect_btn = ctk.CTkButton(
+            input_frame, text="자동 감지", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            fg_color=self.accent_color, text_color="#FFFFFF", hover_color="#0052CC",
+            width=100, command=self.analyze_project
+        )
+        self.detect_btn.pack(side="left")
+        
+        self.project_status_label = ctk.CTkLabel(
+            project_card, text="프로젝트를 선택하고 [자동 감지] 버튼을 눌러 설정을 분석하세요.", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11), text_color="gray"
+        )
+        self.project_status_label.pack(anchor="w", padx=20, pady=(0, 15))
+        
+        # 2. Scope & Target Card
+        scope_card = ctk.CTkFrame(self.content_frame_project)
+        scope_card.pack(fill="x", pady=10)
+        
+        scope_title = ctk.CTkLabel(
+            scope_card, text="대상 OS 및 아키텍처 설정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        scope_title.pack(anchor="w", padx=20, pady=(15, 10))
+        
+        # Target OS Segments
+        os_label = ctk.CTkLabel(scope_card, text="대상 운영체제 (OS)", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"))
+        os_label.pack(anchor="w", padx=20)
+        self.os_segments = ctk.CTkSegmentedButton(
+            scope_card, values=["Windows", "Linux"], 
+            command=self.os_segment_changed,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold")
+        )
+        self.os_segments.pack(fill="x", padx=20, pady=(5, 15))
+        self.os_segments.set("Windows")
+        
+        # Target Arch Segments
+        arch_label = ctk.CTkLabel(scope_card, text="대상 아키텍처 (Arch)", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"))
+        arch_label.pack(anchor="w", padx=20)
+        self.arch_segments = ctk.CTkSegmentedButton(
+            scope_card, values=["x86_64 (Intel/AMD)", "aarch64 (ARM64)"], 
+            command=self.arch_segment_changed,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold")
+        )
+        self.arch_segments.pack(fill="x", padx=20, pady=(5, 15))
+        self.arch_segments.set("x86_64 (Intel/AMD)")
+        
+        # 3. Python Versions Selection Card
+        py_card = ctk.CTkFrame(self.content_frame_project)
+        py_card.pack(fill="x", pady=10)
+        
+        py_title = ctk.CTkLabel(
+            py_card, text="포함할 Python 버전 선택", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        py_title.pack(anchor="w", padx=20, pady=(15, 10))
+        
+        # Grid layout for checkbox row
+        self.checkbox_frame = ctk.CTkFrame(py_card, fg_color="transparent")
+        self.checkbox_frame.pack(fill="x", padx=20, pady=5)
+        
+        for idx, ver in enumerate(self.py_versions):
+            cb = ctk.CTkCheckBox(
+                self.checkbox_frame, text=f"Python {ver}",
+                variable=self.py_vars[ver],
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+            )
+            cb.grid(row=0, column=idx, padx=10, pady=5, sticky="w")
+            self.py_checkboxes[ver] = cb
+            
+        custom_py_frame = ctk.CTkFrame(py_card, fg_color="transparent")
+        custom_py_frame.pack(fill="x", padx=20, pady=(10, 15))
+        
+        custom_py_label = ctk.CTkLabel(custom_py_frame, text="기타 버전 직접 추가:", font=ctk.CTkFont(family=FONT_FAMILY, size=12))
+        custom_py_label.pack(side="left", padx=(0, 8))
+        
+        self.custom_py_entry = ctk.CTkEntry(
+            custom_py_frame, placeholder_text="예: 3.12.3", width=120,
+            font=ctk.CTkFont(size=12)
+        )
+        self.custom_py_entry.pack(side="left", padx=(0, 8))
+        
+        add_py_btn = ctk.CTkButton(
+            custom_py_frame, text="추가", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            width=60, command=self.add_custom_python
+        )
+        add_py_btn.pack(side="left")
+
+    def setup_settings_tab(self) -> None:
+        """
+        '고급 환경 설정' 탭 화면 구성요소를 구축합니다.
+        """
+        # Tab Header
+        tab_header = ctk.CTkLabel(
+            self.content_frame_settings, text="고급 환경 설정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=22, weight="bold"),
+            anchor="w"
+        )
+        tab_header.pack(fill="x", pady=(10, 5))
+        
+        tab_desc = ctk.CTkLabel(
+            self.content_frame_settings, 
+            text="빌드 범위 지정, 프록시 SSL 우회 및 세부 휠 의존성 목록을 정의합니다.",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color="gray", anchor="w"
+        )
+        tab_desc.pack(fill="x", pady=(0, 20))
+        
+        # 1. Package Scope Selection Card
+        scope_card = ctk.CTkFrame(self.content_frame_settings)
+        scope_card.pack(fill="x", pady=10)
+        
+        scope_title = ctk.CTkLabel(
+            scope_card, text="패키지 압축 범위 설정 (Scope)", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        scope_title.pack(anchor="w", padx=20, pady=(15, 8))
+        
+        self.scope_segments = ctk.CTkSegmentedButton(
+            scope_card, values=["전체 압축 (Full)", "신규 변경 압축 (Incremental)"], 
+            command=self.scope_segment_changed,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold")
+        )
+        self.scope_segments.pack(fill="x", padx=20, pady=(5, 12))
+        self.scope_segments.set("전체 압축 (Full)")
+        
+        action_frame = ctk.CTkFrame(scope_card, fg_color="transparent")
+        action_frame.pack(fill="x", padx=20, pady=(0, 15))
+        
+        scope_help = ctk.CTkLabel(
+            action_frame, text="💡 증분 압축은 캐시에 등록된 이전 휠들을 빌드에서 배제해 전송 크기를 줄여줍니다.",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11), text_color="gray"
+        )
+        scope_help.pack(side="left", fill="x", expand=True, anchor="w")
+        
+        self.reset_reg_btn = ctk.CTkButton(
+            action_frame, text="신규패키지 기준 초기화", font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color="#F04452", hover_color="#C0392B", text_color="#FFFFFF",
+            width=150, command=self.reset_wheel_registry
+        )
+        self.reset_reg_btn.pack(side="right")
+        
+        # 2. UV Version & SSL Bypass Options Card
+        ssl_card = ctk.CTkFrame(self.content_frame_settings)
+        ssl_card.pack(fill="x", pady=10)
+        
+        ssl_title = ctk.CTkLabel(
+            ssl_card, text="UV 버전 및 SSL 우회 옵션", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        ssl_title.pack(anchor="w", padx=20, pady=(15, 10))
+        
+        uv_v_frame = ctk.CTkFrame(ssl_card, fg_color="transparent")
+        uv_v_frame.pack(fill="x", padx=20, pady=5)
+        
+        uv_v_label = ctk.CTkLabel(uv_v_frame, text="uv 설치 바이너리 버전 지정:", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"))
+        uv_v_label.pack(side="left", padx=(0, 10))
+        
+        self.uv_version_entry = ctk.CTkEntry(uv_v_frame, font=ctk.CTkFont(size=12), width=150)
+        self.uv_version_entry.insert(0, "latest")
+        self.uv_version_entry.pack(side="left")
+        
+        ssl_label = ctk.CTkLabel(ssl_card, text="사내 보안망 SSL 프록시 우회 옵션:", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"))
+        ssl_label.pack(anchor="w", padx=20, pady=(10, 5))
+        
+        # Segmented radio button mimics
+        self.ssl_segments = ctk.CTkSegmentedButton(
+            ssl_card, values=["Standard (일반)", "System Certs (OS 인증서)", "Trusted Host (PyPI 신뢰)"],
+            command=self.ssl_segment_changed,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold")
+        )
+        self.ssl_segments.pack(fill="x", padx=20, pady=(0, 15))
+        self.ssl_segments.set("Standard (일반)")
+        
+        # 3. Custom PIP List Card
+        pip_card = ctk.CTkFrame(self.content_frame_settings)
+        pip_card.pack(fill="x", pady=10)
+        
+        pip_title = ctk.CTkLabel(
+            pip_card, text="수동 추가할 PIP 라이브러리 목록 (requirements.txt 형식)", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        pip_title.pack(anchor="w", padx=20, pady=(15, 5))
+        
+        self.pip_packages_text = ctk.CTkTextbox(
+            pip_card, height=120, font=ctk.CTkFont(family="Consolas", size=12)
+        )
+        self.pip_packages_text.pack(fill="x", padx=20, pady=(0, 15))
+        self.pip_packages_text.insert("end", "# 예: numpy\n# pandas>=2.0.0\n# requests\n")
+        
+        # 4. Output Zip Setting Card
+        out_card = ctk.CTkFrame(self.content_frame_settings)
+        out_card.pack(fill="x", pady=10)
+        
+        out_title = ctk.CTkLabel(
+            out_card, text="저장할 오프라인 패키지 ZIP 파일 경로 지정", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold")
+        )
+        out_title.pack(anchor="w", padx=20, pady=(15, 8))
+        
+        out_frame = ctk.CTkFrame(out_card, fg_color="transparent")
+        out_frame.pack(fill="x", padx=20, pady=(0, 15))
+        
+        self.output_path_entry = ctk.CTkEntry(
+            out_frame, font=ctk.CTkFont(size=12)
         )
         default_out = os.path.join(os.getcwd(), "uv-offline-package.zip")
         self.output_path_entry.insert(0, default_out)
-        self.output_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), ipady=4)
+        self.output_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
-        browse_btn = tk.Button(
-            path_input_frame, text="찾아보기...", command=self.browse_output,
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, bg="#E5E8EB", fg=self.fg_color,
-            cursor="hand2", padx=12, pady=4
+        out_browse_btn = ctk.CTkButton(
+            out_frame, text="변경...", font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            width=100, command=self.browse_output
         )
-        browse_btn.pack(side=tk.RIGHT)
-        
-        # 3. Action Section (Large Flat Toss Blue Button)
-        self.build_btn = tk.Button(
-            scrollable_frame, text="오프라인 설치 팩 생성 (Build)", 
-            command=self.start_build, font=("Malgun Gothic", 12, "bold"), 
-            bg=self.accent_color, fg="#FFFFFF", activebackground="#0052CC", activeforeground="#FFFFFF",
-            relief="flat", bd=0, cursor="hand2", pady=14
-        )
-        self.build_btn.pack(fill=tk.X, pady=20, padx=5)
-        
-        # 4. Progress and Log Card (Modern Border with High Contrast Card Layout)
-        self.progress_card = tk.Frame(
-            scrollable_frame, bg=self.card_color, 
-            highlightthickness=1, highlightbackground="#E5E8EB", bd=0
-        )
-        self.progress_card.pack(fill=tk.X, pady=10, padx=5)
-        self.progress_card.pack_forget() # Hide initially
-        
-        progress_card_inner = tk.Frame(self.progress_card, bg=self.card_color)
-        progress_card_inner.pack(fill=tk.X, padx=20, pady=20)
-        
-        self.status_label = tk.Label(progress_card_inner, text="작업 대기 중...", font=("Malgun Gothic", 10, "bold"), bg=self.card_color, fg=self.fg_color)
-        self.status_label.pack(anchor=tk.W, pady=(0, 8))
-        
-        self.progress_bar = ttk.Progressbar(progress_card_inner, orient="horizontal", mode="determinate")
-        self.progress_bar.pack(fill=tk.X, pady=(0, 12))
-        
-        log_label = tk.Label(progress_card_inner, text="상세 진행 상태 로그:", font=("Malgun Gothic", 9, "bold"), bg=self.card_color, fg=self.fg_muted)
-        log_label.pack(anchor=tk.W, pady=(5, 4))
-        
-        log_text_frame = tk.Frame(progress_card_inner, bg=self.console_bg,
-                                   highlightthickness=1, highlightbackground="#E5E8EB")
-        log_text_frame.pack(fill=tk.X, pady=5)
-        log_scroll = ttk.Scrollbar(log_text_frame, orient="vertical")
-        self.log_text = tk.Text(
-            log_text_frame, height=12, bg=self.console_bg, fg="#F3F4F6",
-            font=("Consolas", 9), relief="flat", state=tk.DISABLED,
-            highlightthickness=0, yscrollcommand=log_scroll.set
-        )
-        log_scroll.config(command=self.log_text.yview)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-    def toggle_os(self, value):
-        self.target_os_var.set(value)
-        if value == "windows":
-            self.os_win_btn.configure(bg=self.accent_color, fg="#FFFFFF")
-            self.os_lin_btn.configure(bg="#E5E8EB", fg=self.fg_muted)
-        else:
-            self.os_win_btn.configure(bg="#E5E8EB", fg=self.fg_muted)
-            self.os_lin_btn.configure(bg=self.accent_color, fg="#FFFFFF")
+        out_browse_btn.pack(side="left")
 
-    def toggle_arch(self, value):
-        self.target_arch_var.set(value)
-        if value == "x86_64":
-            self.arch_64_btn.configure(bg=self.accent_color, fg="#FFFFFF")
-            self.arch_arm_btn.configure(bg="#E5E8EB", fg=self.fg_muted)
+    def setup_logs_tab(self) -> None:
+        """
+        '빌드 및 콘솔 로그' 탭 화면 구성요소를 구축합니다.
+        """
+        # 1. Action & Progress section at Top
+        action_card = ctk.CTkFrame(self.content_frame_logs)
+        action_card.pack(fill="x", padx=20, pady=(15, 10))
+        
+        self.build_btn = ctk.CTkButton(
+            action_card, text="오프라인 설치 팩 생성 (Build)", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold"),
+            fg_color=self.accent_color, text_color="#FFFFFF", hover_color="#0052CC",
+            height=45, command=self.start_build
+        )
+        self.build_btn.pack(fill="x", padx=20, pady=15)
+        
+        self.status_label = ctk.CTkLabel(
+            action_card, text="대기 중... 빌드 버튼을 누르시면 오프라인 빌드가 수행됩니다.", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            anchor="w"
+        )
+        self.status_label.pack(fill="x", padx=20, pady=(0, 5))
+        
+        self.progress_bar = ctk.CTkProgressBar(action_card, height=10)
+        self.progress_bar.pack(fill="x", padx=20, pady=(0, 15))
+        self.progress_bar.set(0.0)
+        
+        # 2. Console Logs card
+        logs_card = ctk.CTkFrame(self.content_frame_logs)
+        logs_card.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        
+        logs_title = ctk.CTkLabel(
+            logs_card, text="상세 진행 상태 로그 콘솔", 
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")
+        )
+        logs_title.pack(anchor="w", padx=20, pady=(12, 4))
+        
+        # Dark black CLI style textbox
+        self.log_text = ctk.CTkTextbox(
+            logs_card, font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color="#18181B", text_color="#F4F4F5"
+        )
+        self.log_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        
+    def os_segment_changed(self, value: str) -> None:
+        """
+        대상 OS 변경 시 상태 변수를 갱신합니다.
+        """
+        if value == "Windows":
+            self.target_os_var.set("windows")
         else:
-            self.arch_64_btn.configure(bg="#E5E8EB", fg=self.fg_muted)
-            self.arch_arm_btn.configure(bg=self.accent_color, fg="#FFFFFF")
-
-    def toggle_scope(self, value):
-        self.package_scope_var.set(value)
-        if value == "all":
-            self.scope_all_btn.configure(bg=self.accent_color, fg="#FFFFFF")
-            self.scope_new_btn.configure(bg="#E5E8EB", fg=self.fg_muted)
+            self.target_os_var.set("linux")
+            
+    def arch_segment_changed(self, value: str) -> None:
+        """
+        대상 CPU 아키텍처 변경 시 상태 변수를 갱신합니다.
+        """
+        if "x86_64" in value:
+            self.target_arch_var.set("x86_64")
         else:
-            self.scope_all_btn.configure(bg="#E5E8EB", fg=self.fg_muted)
-            self.scope_new_btn.configure(bg=self.accent_color, fg="#FFFFFF")
+            self.target_arch_var.set("aarch64")
+            
+    def scope_segment_changed(self, value: str) -> None:
+        """
+        패키지 압축 범위(Full/Incremental) 선택 시 상태 변수를 갱신합니다.
+        """
+        if "전체" in value:
+            self.package_scope_var.set("all")
+        else:
+            self.package_scope_var.set("new")
+            
+    def ssl_segment_changed(self, value: str) -> None:
+        """
+        보안망 우회 SSL 옵션 선택 시 상태 변수를 갱신합니다.
+        """
+        if "Standard" in value:
+            self.ssl_bypass_var.set("standard")
+        elif "System" in value:
+            self.ssl_bypass_var.set("system_certs")
+        else:
+            self.ssl_bypass_var.set("trusted_host")
+            
+    def browse_project(self) -> None:
+        """
+        폴더 선택 모달을 띄워 로컬 프로젝트 디렉토리를 탐색하고 지정합니다.
+        """
+        path = filedialog.askdirectory()
+        if path:
+            self.project_path_entry.delete(0, "end")
+            self.project_path_entry.insert(0, path)
+            self.analyze_project()
+            
+    def browse_output(self) -> None:
+        """
+        파일 저장 다이얼로그를 띄워 오프라인 패키지가 저장될 zip 파일 경로를 설정합니다.
+        """
+        path = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+            initialfile="uv-offline-package.zip"
+        )
+        if path:
+            self.output_path_entry.delete(0, "end")
+            self.output_path_entry.insert(0, path)
+            
+    def analyze_project(self) -> None:
+        """
+        입력된 프로젝트 디렉토리 내의 .python-version 및 pyproject.toml 파일을 분석하여
+        Python 요구 버전을 자동 판별하고, 화면 UI 체크박스를 자동 토글합니다.
+        """
+        path = self.project_path_entry.get().strip()
+        if not path:
+            messagebox.showwarning("입력 확인", "프로젝트 디렉토리 경로가 입력되지 않았습니다.")
+            return
+            
+        if not os.path.exists(path):
+            messagebox.showerror("오류", "입력한 경로가 존재하지 않습니다.")
+            return
+            
+        settings = detect_project_settings(path)
+        if not settings:
+            self.project_status_label.configure(
+                text="⚠️ pyproject.toml 파일을 찾을 수 없습니다.", 
+                text_color="#F04452"
+            )
+            messagebox.showwarning("분석 실패", "해당 디렉토리에 pyproject.toml 파일이 없습니다.")
+            return
+            
+        status_parts = []
+        status_parts.append("pyproject.toml 감지됨")
+        
+        if settings.get("has_uv_lock"):
+            status_parts.append("uv.lock 감지됨")
+        else:
+            status_parts.append("uv.lock 없음")
+            
+        detected_pys = settings.get("python_versions")
+        if detected_pys:
+            status_parts.append(f"요구 Python: {', '.join(detected_pys)}")
+            # 탐지된 파이썬 버전을 자동 체크하고 다른 버전들은 체크 해제
+            for ver in self.py_vars:
+                is_needed = (ver in detected_pys)
+                self.py_vars[ver].set(is_needed)
+                
+        self.project_status_label.configure(
+            text=f"✓ {' / '.join(status_parts)}", 
+            text_color="#00D4B2"
+        )
+        messagebox.showinfo("분석 완료", "프로젝트 설정을 정상적으로 감지하고 Python 버전을 자동 체크했습니다.")
 
-    def reset_wheel_registry(self):
-        """downloaded_wheels.json 을 삭제하여 신규패키지 기준을 초기화합니다."""
-        # workspace_dir: builder.py 와 동일한 로직으로 결정
+    def add_custom_python(self) -> None:
+        """
+        사용자가 텍스트 창에 입력한 추가 파이썬 버전을 체크박스 목록에 생성 및 체크합니다.
+        """
+        ver = self.custom_py_entry.get().strip()
+        if not ver:
+            return
+            
+        if not re.match(r"^\d+\.\d+(\.\d+)?$", ver):
+            messagebox.showerror("입력 오류", "올바른 파이썬 버전 형식이 아닙니다 (예: 3.12.3 또는 3.11)")
+            return
+            
+        if ver in self.py_vars:
+            messagebox.showwarning("입력 경고", "이미 존재하는 버전입니다.")
+            self.custom_py_entry.delete(0, "end")
+            return
+            
+        self.py_versions.append(ver)
+        var = tk.BooleanVar(value=True)
+        self.py_vars[ver] = var
+        
+        cb = ctk.CTkCheckBox(
+            self.checkbox_frame, text=f"Python {ver}",
+            variable=var,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+        )
+        col = len(self.py_vars) - 1
+        cb.grid(row=col // 5, column=col % 5, padx=10, pady=5, sticky="w")
+        self.py_checkboxes[ver] = cb
+        
+        self.custom_py_entry.delete(0, "end")
+        messagebox.showinfo("추가 완료", f"Python {ver} 버전이 목록에 추가되고 선택되었습니다.")
+        
+    def reset_wheel_registry(self) -> None:
+        """
+        신규 패키지 판정의 기준선 역할을 하는 다운로드 휠 레지스트리 캐시 파일을 영구 삭제하여 초기화합니다.
+        """
         if getattr(sys, 'frozen', False):
             workspace_dir = os.path.dirname(sys.executable)
         else:
             workspace_dir = os.path.dirname(os.path.abspath(__file__))
-
+            
         registry_file = os.path.join(workspace_dir, "cache", "downloaded_wheels.json")
-
+        
         if not os.path.exists(registry_file):
             messagebox.showinfo(
                 "초기화 완료",
@@ -432,18 +656,16 @@ class BuilderApp:
                 "이미 초기화 상태입니다."
             )
             return
-
-        # 현재 등록 건수 표시
+            
         try:
-            import json
             with open(registry_file, "r", encoding="utf-8") as f:
                 registry = json.load(f)
             count = len(registry)
         except Exception:
             count = -1
-
+            
         count_msg = f"현재 {count}개 패키지가 기준으로 등록되어 있습니다.\n" if count >= 0 else ""
-
+        
         confirmed = messagebox.askyesno(
             "신규패키지 기준 초기화",
             f"{count_msg}\n"
@@ -453,7 +675,7 @@ class BuilderApp:
         )
         if not confirmed:
             return
-
+            
         try:
             os.remove(registry_file)
             messagebox.showinfo(
@@ -464,115 +686,74 @@ class BuilderApp:
         except Exception as e:
             messagebox.showerror("초기화 실패", f"파일 삭제 중 오류가 발생했습니다:\n{e}")
 
-    def toggle_py_version(self, ver):
-        current = self.py_vars[ver].get()
-        new_state = not current
-        self.py_vars[ver].set(new_state)
+    def append_log(self, text: str) -> None:
+        """
+        상세 진행 로그 텍스트 에어리어에 로그 메시지를 추가하고 스크롤을 하단으로 자동 조정합니다.
+        """
+        self.log_text.insert("end", text + "\n")
+        self.log_text.see("end")
         
-        btn = self.py_buttons[ver]
-        if new_state:
-            btn.configure(bg=self.accent_color, fg="#FFFFFF")
-        else:
-            btn.configure(bg="#E5E8EB", fg=self.fg_muted)
-
-    def add_custom_python(self):
-        ver = self.custom_py_entry.get().strip()
-        if not ver:
-            return
+    def update_progress(self, percent: float) -> None:
+        """
+        진행률 프로그레스바 값을 갱신합니다. (CustomTkinter 프로그레스바는 0.0 ~ 1.0 범위를 가집니다)
+        """
+        self.progress_bar.set(percent / 100.0)
         
-        # Simple ver format validate
-        import re
-        if not re.match(r"^\d+\.\d+(\.\d+)?$", ver):
-            messagebox.showerror("입력 오류", "올바른 파이썬 버전 형식이 아닙니다 (예: 3.12.3 또는 3.11)")
-            return
-            
-        if ver in self.py_vars:
-            messagebox.showwarning("입력 경고", "이미 존재하는 버전입니다.")
-            self.custom_py_entry.delete(0, tk.END)
-            return
-            
-        self.py_versions.append(ver)
-        var = tk.BooleanVar(value=True)
-        self.py_vars[ver] = var
-        
-        btn = tk.Button(
-            self.checkbox_frame, text=f"Python {ver}", 
-            command=lambda v=ver: self.toggle_py_version(v),
-            font=("Malgun Gothic", 9, "bold"), relief="flat", bd=0, cursor="hand2", padx=15, pady=6,
-            bg=self.accent_color, fg="#FFFFFF"
-        )
-        col = len(self.py_vars) - 1
-        btn.grid(row=col // 5, column=col % 5, padx=4, pady=5)
-        self.py_buttons[ver] = btn
-        
-        self.custom_py_entry.delete(0, tk.END)
-        messagebox.showinfo("추가 완료", f"Python {ver} 버전이 목록에 추가되고 선택되었습니다.")
-        
-    def browse_output(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".zip",
-            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
-            initialfile="uv-offline-package.zip"
-        )
-        if path:
-            self.output_path_entry.delete(0, tk.END)
-            self.output_path_entry.insert(0, path)
-            
-    def append_log(self, text):
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, text + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
-        
-    def update_progress(self, percent):
-        self.progress_bar["value"] = percent
-        
-    def update_status_text(self, text):
+    def update_status_text(self, text: str) -> None:
+        """
+        UI 상태 레이블 텍스트를 변경합니다.
+        """
         self.status_label.configure(text=text)
         
-    def start_build(self):
+    def start_build(self) -> None:
+        """
+        지정된 폼 구성값들을 사용하여 백그라운드 스레드 상에서 오프라인 설치 패키지 생성 작업을 촉발합니다.
+        """
         # 1. Gather form input
         target_os = self.target_os_var.get()
         target_arch = self.target_arch_var.get()
         uv_version = self.uv_version_entry.get().strip() or "latest"
         output_zip = self.output_path_entry.get().strip()
         ssl_bypass = self.ssl_bypass_var.get()
+        project_path = self.project_path_entry.get().strip() or None
         
         selected_py = [ver for ver, var in self.py_vars.items() if var.get()]
         if not selected_py:
             messagebox.showerror("입력 오류", "최소 1개 이상의 Python 버전을 선택해주세요.")
             return
             
-        pip_text = self.pip_packages_text.get("1.0", tk.END)
+        pip_text = self.pip_packages_text.get("1.0", "end")
         pip_packages = []
         for line in pip_text.split("\n"):
             line = line.strip()
             if line and not line.startswith("#"):
                 pip_packages.append(line)
                 
+        if not pip_packages and not project_path:
+            messagebox.showerror("입력 오류", "포함할 PIP 라이브러리 목록을 입력하거나 동기화 프로젝트 경로를 선택해주세요.")
+            return
+            
         if not output_zip:
             messagebox.showerror("입력 오류", "저장할 출력 ZIP 경로를 설정해주세요.")
             return
             
-        # 2. Setup progress panel
-        self.progress_card.pack(fill=tk.X, pady=10)
-        self.build_btn.configure(state=tk.DISABLED)
-        self.progress_bar["value"] = 0
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.delete("1.0", tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        # Switch tab view to Logs automatically when starting build
+        self.select_tab("logs")
+        self.build_btn.configure(state="disabled")
+        self.progress_bar.set(0.0)
+        self.log_text.delete("1.0", "end")
         
-        # 3. Thread Safe Callbacks
+        # Thread Safe Callbacks
         def thread_safe_log(msg):
-            self.root.after(0, lambda: self.append_log(msg))
+            self.after(0, lambda: self.append_log(msg))
             
         def thread_safe_progress(pct):
-            self.root.after(0, lambda: self.update_progress(pct))
+            self.after(0, lambda: self.update_progress(pct))
             
         def thread_safe_status(txt):
-            self.root.after(0, lambda: self.update_status_text(txt))
+            self.after(0, lambda: self.update_status_text(txt))
             
-        # 4. Background thread execution
+        # Background thread execution
         def run():
             try:
                 thread_safe_status("패키징 빌드 작업 진행 중...")
@@ -588,12 +769,12 @@ class BuilderApp:
                     log_callback=thread_safe_log,
                     progress_callback=thread_safe_progress,
                     package_scope=self.package_scope_var.get(),
-                    ssl_bypass=ssl_bypass
+                    ssl_bypass=ssl_bypass,
+                    project_path=project_path
                 )
                 
                 thread_safe_status("빌드 완료!")
                 
-                # Show popup
                 def show_result():
                     if info.get("size_warning"):
                         messagebox.showwarning(
@@ -606,24 +787,22 @@ class BuilderApp:
                             "빌드 완료", 
                             f"오프라인 패키지가 성공적으로 생성되었습니다!\n\n경로: {output_zip}\n타겟 OS: {info['target_os'].upper()}\n포함된 패키지: {info['package_count']}개"
                         )
-                self.root.after(0, show_result)
+                self.after(0, show_result)
             except Exception as e:
                 thread_safe_status("빌드 에러 발생")
                 thread_safe_log(f"[ERROR] 빌드에 실패했습니다: {e}")
-                self.root.after(0, lambda: messagebox.showerror("빌드 실패", f"에러가 발생하여 빌드가 취소되었습니다.\n\n상세 정보:\n{e}"))
+                self.after(0, lambda: messagebox.showerror("빌드 실패", f"에러가 발생하여 빌드가 취소되었습니다.\n\n상세 정보:\n{e}"))
             finally:
-                self.root.after(0, lambda: self.build_btn.configure(state=tk.NORMAL))
+                self.after(0, lambda: self.build_btn.configure(state="normal"))
                 
         t = threading.Thread(target=run, daemon=True)
         t.start()
 
 if __name__ == "__main__":
-    # Prevent Windows from grouping it incorrectly under Python
     if sys.platform == 'win32':
         import ctypes
-        myappid = 'google.deepmind.uvtool.builder.1.0'
+        myappid = 'google.deepmind.uvtool.builder.2.1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         
-    root = tk.Tk()
-    app = BuilderApp(root)
-    root.mainloop()
+        app = BuilderApp()
+        app.mainloop()

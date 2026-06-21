@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import customtkinter
 root = os.path.join(SPECPATH, '..')
+ctk_path = os.path.dirname(customtkinter.__file__)
 
 a = Analysis(
     [os.path.join(root, 'builder_gui.py')],
@@ -9,12 +11,14 @@ a = Analysis(
     datas=[
         (os.path.join(root, 'dist/installer_gui.exe'), '.'),
         (os.path.join(root, 'src/*.py'), 'src'),
+        (os.path.join(ctk_path, 'assets'), 'customtkinter/assets'),
     ],
     hiddenimports=[
         'src',
         'src.builder',
         'src.installer',
         'src.utils',
+        'customtkinter',
     ],
     hookspath=[],
     hooksconfig={},

@@ -1,14 +1,42 @@
 import os
-import sys
 import ssl
+import sys
+import tarfile
 import urllib.request
 import zipfile
-import tarfile
+from typing import Callable, Optional
 
-def download_file(url, dest_path, progress_callback=None, status_callback=None, ssl_bypass="standard"):
+# Windows 전용 모듈 조건부 로드 (IDE 정적 분석 경고 방지용 대체 정의 포함)
+if sys.platform == 'win32':
+    import ctypes
+    import winreg
+else:
+    ctypes = None
+    winreg = None
+
+
+def download_file(
+    url: str,
+    dest_path: str,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    ssl_bypass: str = "standard"
+) -> bool:
     """
-    Downloads a file from URL to dest_path with progress reporting.
-    Supports secure or insecure connection modes based on ssl_bypass settings.
+    지정된 URL에서 파일을 다운로드하여 대상 경로(dest_path)에 저장합니다.
+
+    Args:
+        url (str): 다운로드할 대상 URL.
+        dest_path (str): 다운로드 완료 후 저장할 로컬 파일 경로.
+        progress_callback (Optional[Callable[[int], None]], optional): 다운로드 진행률(0~100)을 수신할 콜백 함수. Defaults to None.
+        status_callback (Optional[Callable[[str], None]], optional): 상태 메시지를 수신할 콜백 함수. Defaults to None.
+        ssl_bypass (str, optional): SSL 검증 우회 수준 설정 ("standard", "trusted_host", "system_certs"). Defaults to "standard".
+
+    Returns:
+        bool: 다운로드 성공 시 True 반환.
+
+    Raises:
+        Exception: 네트워크 오류 및 SSL 검증 에러 발생 시 발생.
     """
     if status_callback:
         status_callback(f"다운로드 중: {os.path.basename(dest_path)} (SSL 모드: {ssl_bypass})...")
@@ -73,9 +101,23 @@ def download_file(url, dest_path, progress_callback=None, status_callback=None, 
                 raise e2
 
 
-def extract_zip(zip_path, dest_dir, progress_callback=None, status_callback=None):
+def extract_zip(
+    zip_path: str,
+    dest_dir: str,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None
+) -> bool:
     """
-    Extracts a ZIP file to dest_dir.
+    ZIP 압축 파일을 지정된 디렉토리(dest_dir)에 압축 해제합니다.
+
+    Args:
+        zip_path (str): ZIP 파일 경로.
+        dest_dir (str): 압축 해제할 대상 디렉토리 경로.
+        progress_callback (Optional[Callable[[int], None]], optional): 압축 해제 진행률(0~100)을 수신할 콜백 함수. Defaults to None.
+        status_callback (Optional[Callable[[str], None]], optional): 상태 메시지를 수신할 콜백 함수. Defaults to None.
+
+    Returns:
+        bool: 압축 해제 성공 시 True 반환.
     """
     if status_callback:
         status_callback(f"압축 해제 중: {os.path.basename(zip_path)}...")
@@ -101,9 +143,24 @@ def extract_zip(zip_path, dest_dir, progress_callback=None, status_callback=None
             status_callback(f"[ERROR] ZIP 압축 해제 실패: {e}")
         raise e
 
-def extract_tar_gz(tar_path, dest_dir, progress_callback=None, status_callback=None):
+def extract_tar_gz(
+    tar_path: str,
+    dest_dir: str,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None
+) -> bool:
     """
-    Extracts a .tar.gz file to dest_dir.
+    tar.gz 압축 파일을 지정된 디렉토리(dest_dir)에 압축 해제합니다.
+    디렉토리 상위 경로 탐색 공격(Path Traversal) 방어 로직이 적용되어 있습니다.
+
+    Args:
+        tar_path (str): tar.gz 파일 경로.
+        dest_dir (str): 압축 해제할 대상 디렉토리 경로.
+        progress_callback (Optional[Callable[[int], None]], optional): 압축 해제 진행률(0~100)을 수신할 콜백 함수. Defaults to None.
+        status_callback (Optional[Callable[[str], None]], optional): 상태 메시지를 수신할 콜백 함수. Defaults to None.
+
+    Returns:
+        bool: 압축 해제 성공 시 True 반환.
     """
     if status_callback:
         status_callback(f"압축 해제 중: {os.path.basename(tar_path)}...")
@@ -136,16 +193,15 @@ def extract_tar_gz(tar_path, dest_dir, progress_callback=None, status_callback=N
             status_callback(f"[ERROR] TAR.GZ 압축 해제 실패: {e}")
         raise e
 
-def broadcast_setting_change():
+def broadcast_setting_change() -> None:
     """
-    Broadcasts WM_SETTINGCHANGE message to all Windows processes.
-    Forces Explorer to reload environment variables without rebooting.
+    Windows 시스템의 모든 활성 프로세스에 WM_SETTINGCHANGE 메시지를 전송합니다.
+    이를 통해 재부팅 없이 환경 변수 설정(PATH 등)이 윈도우 탐색기에 즉시 반영됩니다.
     """
     if sys.platform != 'win32':
         return
         
     try:
-        import ctypes
         HWND_BROADCAST = 0xFFFF
         WM_SETTINGCHANGE = 0x001A
         SMTO_ABORTIFHUNG = 0x0002
@@ -158,16 +214,22 @@ def broadcast_setting_change():
     except Exception as e:
         print(f"Warning: Failed to broadcast system change message: {e}")
 
-def set_user_environment_variable(name, value):
+def set_user_environment_variable(name: str, value: str) -> bool:
     """
-    Sets a user environment variable persistently in Windows Registry.
+    사용자 환경 변수를 Windows 레지스트리(HKEY_CURRENT_USER\\Environment)에 영구적으로 등록합니다.
+
+    Args:
+        name (str): 환경 변수 이름.
+        value (str): 환경 변수 값.
+
+    Returns:
+        bool: 설정 성공 시 True, 실패 시 False 반환.
     """
     if sys.platform != 'win32':
         # Fallback for Linux (can write to .bashrc)
         return False
         
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
         winreg.CloseKey(key)
@@ -177,11 +239,20 @@ def set_user_environment_variable(name, value):
         print(f"Failed to set user env variable {name}: {e}")
         return False
 
-def fetch_uv_installer_original(dest_path=None, ssl_bypass="standard"):
+def fetch_uv_installer_original(
+    dest_path: Optional[str] = None,
+    ssl_bypass: str = "standard"
+) -> str:
     """
-    Downloads the original Astral uv installer PS1 (irm https://astral.sh/uv/install.ps1)
-    for reference. Skips download if the file already exists.
-    Returns the path to the file.
+    인터넷망 모드에서 최신 Astral uv 공식 설치용 PowerShell 스크립트를 참조용으로 가져옵니다.
+    파일이 이미 있으면 다운로드를 건너뜁니다.
+
+    Args:
+        dest_path (Optional[str], optional): 다운로드받을 로컬 대상 파일 경로. Defaults to None.
+        ssl_bypass (str, optional): SSL 우회 방식 설정. Defaults to "standard".
+
+    Returns:
+        str: 다운로드 또는 확인된 파일의 절대 경로.
     """
     if dest_path is None:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -212,16 +283,21 @@ def fetch_uv_installer_original(dest_path=None, ssl_bypass="standard"):
     return dest_path
 
 
-def add_to_user_path(new_path):
+def add_to_user_path(new_path: str) -> bool:
     """
-    Safely adds a folder path to the User PATH environment variable.
-    Checks if path already exists before appending.
+    사용자의 PATH 환경 변수에 지정된 폴더 경로를 안전하게 추가합니다.
+    중복 등록을 방지하기 위해 중복 검사를 거친 후 레지스트리를 갱신합니다.
+
+    Args:
+        new_path (str): PATH에 추가할 신규 폴더 경로.
+
+    Returns:
+        bool: 추가 성공(혹은 이미 있는 경우) 시 True, 실패 시 False 반환.
     """
     if sys.platform != 'win32':
         return False
         
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_ALL_ACCESS)
         try:
             current_path, data_type = winreg.QueryValueEx(key, "Path")

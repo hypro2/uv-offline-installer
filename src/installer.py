@@ -1,15 +1,29 @@
-import os
-import shutil
 import glob
+import os
 import platform
+import shutil
 import subprocess
 import traceback
-from .utils import extract_zip, extract_tar_gz, set_user_environment_variable, add_to_user_path, download_file
+from typing import Any, Callable, Dict, Optional
 
-def get_bundled_info(payload_dir):
+from .utils import (
+    add_to_user_path,
+    download_file,
+    extract_tar_gz,
+    extract_zip,
+    set_user_environment_variable,
+)
+
+def get_bundled_info(payload_dir: str) -> Dict[str, Any]:
     """
-    Scans the payload folder to list uv version, Python versions, and wheels available.
-    Supports both nested installer payload structures and direct flat export folder layouts.
+    지정된 페이로드(payload) 디렉토리를 탐색하여 동봉된 uv 아카이브, Python standalone 압축본, 그리고 휠(wheel) 파일 목록을 수집합니다.
+    중첩된 페이로드 구조와 평탄한(flat) 내보내기 폴더 레이아웃을 모두 지원합니다.
+
+    Args:
+        payload_dir (str): 탐색 대상 페이로드 디렉토리 경로.
+
+    Returns:
+        Dict[str, Any]: {"uv_archive": Optional[str], "python_archives": List[str], "wheels": List[str]} 구조의 상세 정보 딕셔너리.
     """
     info = {
         "uv_archive": None,
@@ -71,9 +85,33 @@ def get_bundled_info(payload_dir):
         
     return info
 
-def install_offline(payload_dir, install_dir, log_callback, progress_callback, register_global_env=True, offline_mode=True, ssl_bypass="standard"):
+def install_offline(
+    payload_dir: str,
+    install_dir: str,
+    log_callback: Callable[[str], None],
+    progress_callback: Callable[[int], None],
+    register_global_env: bool = True,
+    offline_mode: bool = True,
+    ssl_bypass: str = "standard"
+) -> bool:
     """
-    Performs the local offline installation.
+    로컬 오프라인 패키지를 사용하여 uv 및 Python 독립 환경을 대상 경로(install_dir)에 설치하고 설정합니다.
+
+    Args:
+        payload_dir (str): 설치 소스 파일이 들어있는 페이로드 폴더 경로.
+        install_dir (str): 설치 목적지 폴더 경로.
+        log_callback (Callable[[str], None]): 설치 진행 로그를 수신할 콜백 함수.
+        progress_callback (Callable[[int], None]): 진행율 퍼센트(0~100)를 수신할 콜백 함수.
+        register_global_env (bool, optional): 전역 환경 변수를 등록할지 여부. Defaults to True.
+        offline_mode (bool, optional): 엄격한 폐쇄망 모드로 작동할지(인터넷 다운로드 비활성화) 여부. Defaults to True.
+        ssl_bypass (str, optional): 다운로드 시 SSL 필터 우회 수준. Defaults to "standard".
+
+    Returns:
+        bool: 설치 완료 시 True 반환.
+
+    Raises:
+        FileNotFoundError: 필수 바이너리 파일 누락 및 폐쇄망 모드로 다운로드 차단 시 발생.
+        Exception: 설치 실패 원인 예외 발생.
     """
     log_callback(f"[INFO] 설치 시작... 대상 경로: {install_dir} (폐쇄망 모드: {'활성화' if offline_mode else '비활성화'}, SSL 모드: {ssl_bypass})")
     

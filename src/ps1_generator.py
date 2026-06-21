@@ -6,9 +6,16 @@ Generates install_offline.ps1 — the air-gapped replacement for:
 
 def generate_install_ps1(source_dir: str = "", install_dir: str = "") -> str:
     """
-    Returns the complete install_offline.ps1 script as a string.
-    source_dir and install_dir are baked into the param() defaults so the script
-    can be run without arguments (double-click friendly).
+    폐쇄망 오프라인 환경용 PowerShell 설치 스크립트(install_offline.ps1)의 내용을 생성하여 반환합니다.
+    사용자가 지정한 source_dir 및 install_dir 경로를 스크립트 파라미터 기본값으로 채택하여
+    별도의 실행 인자 없이 스크립트를 더블클릭하는 것만으로도 자동 설치되도록 구성합니다.
+
+    Args:
+        source_dir (str, optional): uv, Python, wheels 아카이브가 위치한 소스 폴더 경로. Defaults to "".
+        install_dir (str, optional): uv 및 Python이 설치될 로컬 디렉토리 경로. Defaults to "".
+
+    Returns:
+        str: 생성된 PowerShell 스크립트 전체 텍스트.
     """
     src_default = source_dir.replace("\\", "\\\\") if source_dir else ""
     inst_default = install_dir.replace("\\", "\\\\") if install_dir else r"$env:USERPROFILE\.local\bin"
