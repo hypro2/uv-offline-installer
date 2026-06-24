@@ -14,6 +14,45 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .utils import download_file
 
+SSL_FALLBACK_ORDER = ["system_certs", "trusted_host", "standard"]
+
+def _compile_env_for_ssl(base_env: dict, ssl_mode: str) -> dict:
+    env = dict(base_env)
+    env["UV_NO_PROGRESS"] = "1"
+    env["UV_SYSTEM_CERTS"] = "1"
+    if ssl_mode == "system_certs":
+        env["UV_NATIVE_TLS"] = "1"
+    elif ssl_mode == "trusted_host":
+        env["UV_INSECURE"] = "1"
+    return env
+
+def _compile_cmd_flags_for_ssl(base_cmd: list, ssl_mode: str) -> list:
+    cmd = list(base_cmd)
+    if ssl_mode == "system_certs":
+        cmd.append("--system-certs")
+    return cmd
+
+def _pip_env_for_ssl(base_env: dict, ssl_mode: str) -> dict:
+    env = dict(base_env)
+    if ssl_mode == "system_certs":
+        env["UV_SYSTEM_CERTS"] = "1"
+        env["UV_NATIVE_TLS"] = "1"
+    elif ssl_mode == "trusted_host":
+        env["UV_INSECURE"] = "1"
+    return env
+
+def _pip_cmd_flags_for_ssl(base_cmd: list, ssl_mode: str) -> list:
+    cmd = list(base_cmd)
+    if ssl_mode == "system_certs":
+        cmd.append("--use-feature=truststore")
+    elif ssl_mode == "trusted_host":
+        cmd.extend([
+            "--trusted-host", "pypi.org",
+            "--trusted-host", "files.pythonhosted.org",
+            "--trusted-host", "pypi.python.org",
+        ])
+    return cmd
+
 # Mapping of major.minor to latest CPython patch version for python-build-standalone tag 20260610
 PYTHON_VERSION_MAP = {
     "3.9": "3.9.21",
@@ -147,7 +186,7 @@ def is_docker_available() -> bool:
     if not shutil.which("docker"):
         return False
     try:
-        res = subprocess.run(["docker", "info"], capture_output=True, timeout=3, text=True)
+        res = subprocess.run(["docker", "info"], capture_output=True, timeout=15, text=True)
         return res.returncode == 0
     except Exception:
         return False
@@ -383,24 +422,28 @@ def build_package(
                 else:
                     log_callback("[INFO] pyproject.toml 파일을 분석하여 requirements.txt를 컴파일 중...")
                     compile_cmd = ["uv", "pip", "compile", "pyproject.toml", "-o", req_file_path]
-                
-                # Apply SSL configurations to compilation environment if needed
-                compile_env = os.environ.copy()
-                if ssl_bypass == "system_certs":
-                    compile_env["UV_SYSTEM_CERTS"] = "1"
-                    compile_env["UV_NATIVE_TLS"] = "1"
-                    compile_cmd.append("--system-certs")
-                elif ssl_bypass == "trusted_host":
-                    compile_env["UV_INSECURE"] = "1"
-                    # Do not append "--insecure" since it is not a valid uv argument
-                
-                # Run uv pip compile / uv export
-                try:
-                    res = subprocess.run(compile_cmd, env=compile_env, cwd=project_path, capture_output=True, text=True, check=True)
-                    log_callback("[SUCCESS] 프로젝트 의존성 컴파일 완료.")
-                except subprocess.CalledProcessError as compile_err:
-                    log_callback(f"[ERROR] 프로젝트 의존성 컴파일 실패: {compile_err.stderr}")
-                    raise compile_err
+
+                # Run uv pip compile / uv export with SSL fallback
+                base_env = os.environ.copy()
+                last_compile_err = None
+                for ssl_mode in SSL_FALLBACK_ORDER:
+                    cmd_attempt = _compile_cmd_flags_for_ssl(compile_cmd, ssl_mode)
+                    env_attempt = _compile_env_for_ssl(base_env, ssl_mode)
+                    try:
+                        subprocess.run(cmd_attempt, env=env_attempt, cwd=project_path, capture_output=True, text=True, check=True)
+                        log_callback(f"[SUCCESS] 프로젝트 의존성 컴파일 완료. (SSL: {ssl_mode})")
+                        last_compile_err = None
+                        break
+                    except subprocess.CalledProcessError as e:
+                        err_detail = ((e.stderr or "") + (e.stdout or "")).strip()
+                        last_compile_err = e
+                        next_modes = SSL_FALLBACK_ORDER[SSL_FALLBACK_ORDER.index(ssl_mode) + 1:]
+                        if next_modes:
+                            log_callback(f"[WARNING] SSL 모드 '{ssl_mode}' 실패, '{next_modes[0]}'로 재시도합니다... ({err_detail[:120] if err_detail else 'uv 출력 없음'})")
+                        else:
+                            log_callback(f"[ERROR] 모든 SSL 모드에서 컴파일 실패. ({err_detail[:200] if err_detail else 'uv 출력 없음'})")
+                if last_compile_err:
+                    raise last_compile_err
             else:
                 with open(req_file_path, "w", encoding="utf-8") as rf:
                     for pkg in pip_packages:
@@ -410,7 +453,16 @@ def build_package(
                 log_callback(f"[INFO] Python {py_ver} 버전에 맞는 wheel 패키지 분석 및 다운로드 중 (캐시 활용)...")
                 
                 # Check if Docker should be used for Linux target
-                use_docker = (target_os == "linux" and is_docker_available())
+                if target_os == "linux":
+                    docker_ok = is_docker_available()
+                    if not docker_ok:
+                        if not shutil.which("docker"):
+                            log_callback("[WARNING] Docker 명령어를 찾을 수 없습니다 (PATH 미등록). Docker Desktop을 설치하거나 PATH를 확인하세요.")
+                        else:
+                            log_callback("[WARNING] Docker 데몬 응답 없음 (docker info 실패). Docker Desktop이 완전히 시작되었는지 확인하세요.")
+                    use_docker = docker_ok
+                else:
+                    use_docker = False
                 
                 if use_docker:
                     log_callback("[INFO] Docker 가용 상태가 감지되었습니다. 리눅스 휠 빌드를 위해 Docker 컨테이너를 구동합니다. (sdist 자동 컴파일)")
@@ -425,63 +477,68 @@ def build_package(
                     image_tag = f"python:{py_ver}-slim"
                     
                     # Use 'pip wheel' inside docker container to automatically compile sdist to whl
-                    container_cmd = [
+                    base_container_cmd = [
                         "pip", "wheel",
                         "--wheel-dir", "/wheels",
                         "--cache-dir", "/cache",
                         "-r", docker_req_path
                     ]
-                    
-                    if ssl_bypass == "system_certs" or ssl_bypass == "trusted_host":
-                        log_callback("[WARNING] Docker 내부 빌드 시 OS 신뢰 저장소 옵션이 제한되므로, 도메인 신뢰 강제(--trusted-host) 방식으로 우회 다운로드합니다.")
-                        container_cmd.extend([
-                            "--trusted-host", "pypi.org",
-                            "--trusted-host", "files.pythonhosted.org",
-                            "--trusted-host", "pypi.python.org"
-                        ])
-                        
-                    cmd = [
+                    docker_base_cmd = [
                         "docker", "run", "--rm",
                         "-v", f"{vol_wheels}:/wheels",
                         "-v", f"{vol_temp}:/temp",
                         "-v", f"{vol_cache}:/cache",
                         image_tag
-                    ] + container_cmd
-                    
-                    sub_env = os.environ.copy()
+                    ]
+                    # Docker fallback: standard → trusted_host (OS certs not usable inside container)
+                    docker_ssl_modes = ["standard", "trusted_host"]
+                    pip_success = False
+                    for ssl_mode in docker_ssl_modes:
+                        container_cmd = list(base_container_cmd)
+                        if ssl_mode == "trusted_host":
+                            container_cmd.extend([
+                                "--trusted-host", "pypi.org",
+                                "--trusted-host", "files.pythonhosted.org",
+                                "--trusted-host", "pypi.python.org",
+                            ])
+                        cmd = docker_base_cmd + container_cmd
+                        log_callback(f"[DOCKER] Python {py_ver} 이미지({image_tag})로 Docker 컨테이너를 실행하여 Linux wheel을 빌드합니다. (SSL: {ssl_mode})")
+                        log_callback(f"[DOCKER] 명령: docker run --rm -v ...:/wheels -v ...:/temp -v ...:/cache {image_tag} {' '.join(container_cmd)}")
+                        process = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding='utf-8', errors='replace', env=os.environ.copy()
+                        )
+                        for line in process.stdout:
+                            line_str = line.strip()
+                            if line_str:
+                                log_callback(f"  {'[CACHE]' if 'Using cached' in line_str else '[pip]'} {line_str}")
+                        process.wait()
+                        if process.returncode == 0:
+                            log_callback(f"[SUCCESS] Python {py_ver} 용 패키지 라이브러리 수집 완료. (SSL: {ssl_mode})")
+                            pip_success = True
+                            break
+                        next_modes = docker_ssl_modes[docker_ssl_modes.index(ssl_mode) + 1:]
+                        if next_modes:
+                            log_callback(f"[WARNING] Docker SSL 모드 '{ssl_mode}' 실패 (코드: {process.returncode}), '{next_modes[0]}'로 재시도합니다...")
+                        else:
+                            log_callback(f"[ERROR] Python {py_ver} 용 패키지 수집 중 에러가 발생했습니다 (코드: {process.returncode}).")
+                    if not pip_success:
+                        raise RuntimeError(f"Python {py_ver} 용 패키지 수집에 실패했습니다.")
                 else:
                     host_os = "windows" if sys.platform == "win32" else "linux"
                     if target_os == host_os:
                         log_callback(f"[INFO] 호스트 OS와 타겟 OS가 일치하여, Python {py_ver} 환경에서 직접 휠 빌드(pip wheel)를 실행합니다. (sdist 자동 컴파일)")
-                        cmd = [
+                        base_pip_cmd = [
                             "uv", "run", "--python", py_ver, "--with", "pip", "python", "-m", "pip", "wheel",
                             "--wheel-dir", wheels_dir,
                             "--cache-dir", pip_cache_dir,
                             "-r", req_file_path
                         ]
-                        
-                        sub_env = os.environ.copy()
-                        
-                        if ssl_bypass == "system_certs":
-                            log_callback("[INFO] SSL 우회: OS 신뢰 저장소(System Certs) 인증 수단을 적용합니다.")
-                            sub_env["UV_SYSTEM_CERTS"] = "1"
-                            sub_env["UV_NATIVE_TLS"] = "1"
-                            cmd.append("--use-feature=truststore")
-                        elif ssl_bypass == "trusted_host":
-                            log_callback("[INFO] SSL 우회: PyPI 주요 도메인을 강제 신뢰(--trusted-host)합니다.")
-                            sub_env["UV_INSECURE"] = "1"
-                            cmd.extend([
-                                "--trusted-host", "pypi.org",
-                                "--trusted-host", "files.pythonhosted.org",
-                                "--trusted-host", "pypi.python.org"
-                            ])
-                        else:
-                            log_callback("[INFO] SSL 우회: 표준 다운로드 모드를 사용합니다.")
                     else:
                         if target_os == "linux":
                             log_callback("[WARNING] 리눅스 타겟 빌드이나 Docker를 사용할 수 없습니다. 윈도우 호스트에서 교차 다운로드(Cross-platform)를 실행합니다.")
                         abi_tag = f"cp{py_ver.replace('.', '')}"
-                        cmd = [
+                        base_pip_cmd = [
                             "uv", "run", "--with", "pip", "python", "-m", "pip", "download",
                             "--only-binary=:all:",
                             "--dest", wheels_dir,
@@ -492,56 +549,33 @@ def build_package(
                             "--abi", abi_tag,
                             "-r", req_file_path
                         ]
-                        
-                        sub_env = os.environ.copy()
-                        
-                        if ssl_bypass == "system_certs":
-                            log_callback("[INFO] SSL 우회: OS 신뢰 저장소(System Certs) 인증 수단을 적용합니다.")
-                            sub_env["UV_SYSTEM_CERTS"] = "1"
-                            sub_env["UV_NATIVE_TLS"] = "1"
-                            cmd.append("--use-feature=truststore")
-                        elif ssl_bypass == "trusted_host":
-                            log_callback("[INFO] SSL 우회: PyPI 주요 도메인을 강제 신뢰(--trusted-host)합니다.")
-                            sub_env["UV_INSECURE"] = "1"
-                            cmd.extend([
-                                "--trusted-host", "pypi.org",
-                                "--trusted-host", "files.pythonhosted.org",
-                                "--trusted-host", "pypi.python.org"
-                            ])
+
+                    pip_success = False
+                    for ssl_mode in SSL_FALLBACK_ORDER:
+                        cmd = _pip_cmd_flags_for_ssl(base_pip_cmd, ssl_mode)
+                        sub_env = _pip_env_for_ssl(os.environ.copy(), ssl_mode)
+                        log_callback(f"[INFO] SSL 모드: {ssl_mode}")
+                        log_callback(f"[CMD] {' '.join(cmd)}")
+                        process = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding='utf-8', errors='replace', env=sub_env
+                        )
+                        for line in process.stdout:
+                            line_str = line.strip()
+                            if line_str:
+                                log_callback(f"  {'[CACHE]' if 'Using cached' in line_str else '[pip]'} {line_str}")
+                        process.wait()
+                        if process.returncode == 0:
+                            log_callback(f"[SUCCESS] Python {py_ver} 용 패키지 라이브러리 수집 완료. (SSL: {ssl_mode})")
+                            pip_success = True
+                            break
+                        next_modes = SSL_FALLBACK_ORDER[SSL_FALLBACK_ORDER.index(ssl_mode) + 1:]
+                        if next_modes:
+                            log_callback(f"[WARNING] SSL 모드 '{ssl_mode}' 실패 (코드: {process.returncode}), '{next_modes[0]}'로 재시도합니다...")
                         else:
-                            log_callback("[INFO] SSL 우회: 표준 다운로드 모드를 사용합니다.")
-                
-                log_callback(f"[CMD] {' '.join(cmd)}")
-                
-                # Execute and read stdout line-by-line
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    env=sub_env
-                )
-                
-                while True:
-                    line = process.stdout.readline()
-                    if not line:
-                        break
-                    line_str = line.strip()
-                    if line_str:
-                        # Translate caching feedback to user-friendly logs
-                        if "Using cached" in line_str:
-                            log_callback(f"  [CACHE] {line_str}")
-                        else:
-                            log_callback(f"  [pip] {line_str}")
-                        
-                process.wait()
-                if process.returncode == 0:
-                    log_callback(f"[SUCCESS] Python {py_ver} 용 패키지 라이브러리 수집 완료.")
-                else:
-                    log_callback(f"[ERROR] Python {py_ver} 용 패키지 수집 중 경고/에러가 발생했습니다 (코드: {process.returncode}).")
-                    raise RuntimeError(f"Python {py_ver} 용 패키지 수집에 실패했습니다. (코드: {process.returncode})")
+                            log_callback(f"[ERROR] Python {py_ver} 용 패키지 수집 중 에러가 발생했습니다 (코드: {process.returncode}).")
+                    if not pip_success:
+                        raise RuntimeError(f"Python {py_ver} 용 패키지 수집에 실패했습니다.")
             
             # Scan wheels_dir and compare with registry
             newly_downloaded_wheels = []
